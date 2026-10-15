@@ -15,6 +15,7 @@ from .enum import (
     extract_enum_or_set_values
 )
 from .mysql_api import MySQLApi
+from .clickhouse_api import comment_clause, modify_comment_clause
 
 
 CHARSET_MYSQL_TO_PYTHON = {
@@ -384,6 +385,207 @@ def split_sql_statements(sql):
     return statements
 
 
+MYSQL_STRING_ESCAPES = {
+    '0': '\0',
+    'b': '\b',
+    'n': '\n',
+    'r': '\r',
+    't': '\t',
+    'Z': '\x1a',
+}
+
+
+def unescape_mysql_string(value: str) -> str:
+    """Turn a MySQL string literal body into its actual value."""
+    result = []
+    i = 0
+    while i < len(value):
+        char = value[i]
+        if char == '\\' and i + 1 < len(value):
+            result.append(MYSQL_STRING_ESCAPES.get(value[i + 1], value[i + 1]))
+            i += 2
+            continue
+        # MySQL doubles the quote character to escape it
+        if char in ("'", '"') and i + 1 < len(value) and value[i + 1] == char:
+            result.append(char)
+            i += 2
+            continue
+        result.append(char)
+        i += 1
+    return ''.join(result)
+
+
+def _is_identifier_char(char: str) -> bool:
+    return char.isalnum() or char in '_$'
+
+
+def _skip_quoted(text: str, start: int) -> int:
+    """Return the index just past the quoted region starting at `start`."""
+    quote = text[start]
+    i = start + 1
+    while i < len(text):
+        char = text[i]
+        if char == '\\':
+            i += 2
+            continue
+        if char == quote:
+            if i + 1 < len(text) and text[i + 1] == quote:
+                i += 2  # doubled quote - escaped
+                continue
+            return i + 1
+        i += 1
+    return len(text)
+
+
+def _read_comment_value(text: str, start: int):
+    """
+    Read the value of a COMMENT clause whose keyword ends at `start`.
+
+    Returns (value, end_index), or (None, start) when the keyword is not
+    followed by a quoted string (in which case it is not a COMMENT clause).
+    """
+    i = start
+    while i < len(text) and text[i].isspace():
+        i += 1
+    if i < len(text) and text[i] == '=':
+        i += 1
+        while i < len(text) and text[i].isspace():
+            i += 1
+    if i >= len(text) or text[i] not in ("'", '"'):
+        return None, start
+
+    quote = text[i]
+    body = []
+    i += 1
+    while i < len(text):
+        char = text[i]
+        if char == '\\' and i + 1 < len(text):
+            body.append(char)
+            body.append(text[i + 1])
+            i += 2
+            continue
+        if char == quote:
+            if i + 1 < len(text) and text[i + 1] == quote:
+                body.append(char)
+                body.append(char)
+                i += 2
+                continue
+            i += 1
+            break
+        body.append(char)
+        i += 1
+    return unescape_mysql_string(''.join(body)), i
+
+
+def extract_create_table_comments(create_statement: str):
+    """
+    Collect the COMMENT clauses of a raw MySQL CREATE TABLE statement.
+
+    A COMMENT inside the column list belongs to the closest preceding
+    identifier, which for a column definition is the column name; a COMMENT
+    after the closing parenthesis is the table comment. Returns
+    (column_comments, table_comment), where column_comments only holds the
+    columns that actually have a comment.
+    """
+    column_comments = {}
+    table_comment = ''
+    depth = 0
+    current_name = None
+    i = 0
+    length = len(create_statement)
+
+    while i < length:
+        char = create_statement[i]
+
+        if char == '`':
+            end = create_statement.find('`', i + 1)
+            end = length if end == -1 else end
+            if depth == 1 and current_name is None:
+                current_name = create_statement[i + 1:end]
+            i = end + 1
+            continue
+
+        if char in ("'", '"'):
+            i = _skip_quoted(create_statement, i)
+            continue
+
+        if char == '(':
+            depth += 1
+            i += 1
+            continue
+
+        if char == ')':
+            depth -= 1
+            i += 1
+            continue
+
+        if char == ',':
+            if depth == 1:
+                current_name = None
+            i += 1
+            continue
+
+        if (create_statement[i:i + 7].upper() == 'COMMENT'
+                and (i == 0 or not _is_identifier_char(create_statement[i - 1]))
+                and (i + 7 >= length or not _is_identifier_char(create_statement[i + 7]))):
+            value, end = _read_comment_value(create_statement, i + 7)
+            if value is not None:
+                if depth == 0:
+                    table_comment = value
+                elif depth == 1 and current_name is not None:
+                    column_comments[current_name] = value
+                i = end
+                continue
+
+        # Remember the first token of a column definition so its COMMENT can be
+        # attributed to it. Bare identifiers cover columns that were not
+        # backtick quoted; index definitions set a name that simply never
+        # matches a column.
+        if depth == 1 and current_name is None and (char.isalpha() or char == '_'):
+            end = i
+            while end < length and _is_identifier_char(create_statement[end]):
+                end += 1
+            current_name = create_statement[i:end]
+            i = end
+            continue
+
+        i += 1
+
+    return column_comments, table_comment
+
+
+def extract_comment(statement: str) -> str:
+    """
+    Return the value of the first COMMENT clause of a column definition, or ''.
+
+    Used for ALTER TABLE, where each sub-query defines exactly one column, so
+    there is no need to attribute the comment to a name.
+    """
+    i = 0
+    length = len(statement)
+    while i < length:
+        char = statement[i]
+
+        if char in ("'", '"'):
+            i = _skip_quoted(statement, i)
+            continue
+
+        if char == '`':
+            end = statement.find('`', i + 1)
+            i = (length if end == -1 else end) + 1
+            continue
+
+        if (statement[i:i + 7].upper() == 'COMMENT'
+                and (i == 0 or not _is_identifier_char(statement[i - 1]))
+                and (i + 7 >= length or not _is_identifier_char(statement[i + 7]))):
+            value, end = _read_comment_value(statement, i + 7)
+            if value is not None:
+                return value
+
+        i += 1
+    return ''
+
+
 def convert_timestamp_to_datetime64(input_str, timezone='UTC'):
 
     # Define the regex pattern
@@ -603,8 +805,10 @@ class MysqlToClickhouseConverter:
             clickhouse_structure.fields.append(TableField(
                 name=field.name,
                 field_type=clickhouse_field_type,
+                comment=field.comment,
             ))
         clickhouse_structure.primary_keys = mysql_structure.primary_keys
+        clickhouse_structure.comment = mysql_structure.comment
         clickhouse_structure.preprocess()
         return clickhouse_structure
 
@@ -806,6 +1010,8 @@ class MysqlToClickhouseConverter:
             subquery = subquery.strip()
             if not subquery:
                 continue
+            # Read before splitting: a comment can contain spaces.
+            comment = extract_comment(subquery)
             tokens = subquery.split()
 
             op_name = tokens[0].lower().split('=')[0]
@@ -822,7 +1028,7 @@ class MysqlToClickhouseConverter:
                     if tokens[0].lower().startswith(f'{keyword}('):
                         break
                 else:
-                    self.__convert_alter_table_add_column(db_name, table_name, tokens)
+                    self.__convert_alter_table_add_column(db_name, table_name, tokens, comment)
                 continue
 
             if op_name == 'drop':
@@ -837,7 +1043,7 @@ class MysqlToClickhouseConverter:
                 continue
 
             if op_name == 'modify':
-                self.__convert_alter_table_modify_column(db_name, table_name, tokens)
+                self.__convert_alter_table_modify_column(db_name, table_name, tokens, comment)
                 continue
 
             if op_name == 'alter':
@@ -850,7 +1056,7 @@ class MysqlToClickhouseConverter:
                 continue
 
             if op_name == 'change':
-                self.__convert_alter_table_change_column(db_name, table_name, tokens)
+                self.__convert_alter_table_change_column(db_name, table_name, tokens, comment)
                 continue
             
             if op_name == 'rename':
@@ -926,7 +1132,7 @@ class MysqlToClickhouseConverter:
         else:
             return [column_name] + param_tokens
 
-    def __convert_alter_table_add_column(self, db_name, table_name, tokens):
+    def __convert_alter_table_add_column(self, db_name, table_name, tokens, comment=''):
         tokens = self._tokenize_alter_query(' '.join(tokens))
 
         if len(tokens) < 2:
@@ -944,7 +1150,9 @@ class MysqlToClickhouseConverter:
 
         column_name = strip_sql_name(tokens[0])
         column_type_mysql = tokens[1]
-        column_type_mysql_parameters = ' '.join(tokens[2:])
+        # The comment is handled separately, so drop it here: leftover text like
+        # `COMMENT 'not null here'` would otherwise be read as a NOT NULL marker.
+        column_type_mysql_parameters = self._strip_comments(' '.join(tokens[2:]))
 
         column_type_ch = self.convert_field_type(column_type_mysql, column_type_mysql_parameters)
 
@@ -956,29 +1164,32 @@ class MysqlToClickhouseConverter:
 
             if column_first:
                 mysql_table_structure.add_field_first(
-                    TableField(name=column_name, field_type=column_type_mysql)
+                    TableField(name=column_name, field_type=column_type_mysql, comment=comment)
                 )
-                
+
                 ch_table_structure.add_field_first(
-                    TableField(name=column_name, field_type=column_type_ch)
+                    TableField(name=column_name, field_type=column_type_ch, comment=comment)
                 )
             else:
                 if column_after is None:
                     column_after = strip_sql_name(mysql_table_structure.fields[-1].name)
 
                 mysql_table_structure.add_field_after(
-                    TableField(name=column_name, field_type=column_type_mysql),
+                    TableField(name=column_name, field_type=column_type_mysql, comment=comment),
                     column_after,
                 )
 
                 ch_table_structure.add_field_after(
-                    TableField(name=column_name, field_type=column_type_ch),
+                    TableField(name=column_name, field_type=column_type_ch, comment=comment),
                     column_after,
                 )
 
         target_table_name = self.db_replicator.get_target_table_name(table_name) if self.db_replicator else table_name
         on_cluster = self.db_replicator.clickhouse_api.get_on_cluster_clause() if self.db_replicator else ''
-        query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} ADD COLUMN `{column_name}` {column_type_ch}'
+        query = (
+            f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} '
+            f'ADD COLUMN `{column_name}` {column_type_ch}{comment_clause(comment)}'
+        )
         if column_first:
             query += ' FIRST'
         else:
@@ -1008,13 +1219,15 @@ class MysqlToClickhouseConverter:
         if self.db_replicator:
             self.db_replicator.clickhouse_api.execute_command(query)
 
-    def __convert_alter_table_modify_column(self, db_name, table_name, tokens):
+    def __convert_alter_table_modify_column(self, db_name, table_name, tokens, comment=''):
         if len(tokens) < 2:
             raise Exception('wrong tokens count', tokens)
 
         column_name = strip_sql_name(tokens[0])
         column_type_mysql = tokens[1]
-        column_type_mysql_parameters = ' '.join(tokens[2:])
+        # The comment is handled separately, so drop it here: leftover text like
+        # `COMMENT 'not null here'` would otherwise be read as a NOT NULL marker.
+        column_type_mysql_parameters = self._strip_comments(' '.join(tokens[2:]))
 
         column_type_ch = self.convert_field_type(column_type_mysql, column_type_mysql_parameters)
 
@@ -1025,11 +1238,11 @@ class MysqlToClickhouseConverter:
             ch_table_structure: TableStructure = table_structure[1]
 
             mysql_table_structure.update_field(
-                TableField(name=column_name, field_type=column_type_mysql),
+                TableField(name=column_name, field_type=column_type_mysql, comment=comment),
             )
 
             ch_table_structure.update_field(
-                TableField(name=column_name, field_type=column_type_ch),
+                TableField(name=column_name, field_type=column_type_ch, comment=comment),
             )
 
         target_table_name = self.db_replicator.get_target_table_name(table_name) if self.db_replicator else table_name
@@ -1051,7 +1264,10 @@ class MysqlToClickhouseConverter:
                     inner_type = field_type
                 default_clause = f' DEFAULT {self.__get_default_value_for_type(inner_type)}'
         
-        query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} MODIFY COLUMN `{column_name}` {column_type_ch}{default_clause}'
+        query = (
+            f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} '
+            f'MODIFY COLUMN `{column_name}` {column_type_ch}{default_clause}{modify_comment_clause(comment)}'
+        )
         if self.db_replicator:
             self.db_replicator.clickhouse_api.execute_command(query)
 
@@ -1173,14 +1389,14 @@ class MysqlToClickhouseConverter:
         # Default fallback
         return ''
 
-    def __convert_alter_table_change_column(self, db_name, table_name, tokens):
+    def __convert_alter_table_change_column(self, db_name, table_name, tokens, comment=''):
         if len(tokens) < 3:
             raise Exception('wrong tokens count', tokens)
 
         column_name = strip_sql_name(tokens[0])
         new_column_name = strip_sql_name(tokens[1])
         column_type_mysql = tokens[2]
-        column_type_mysql_parameters = ' '.join(tokens[3:])
+        column_type_mysql_parameters = self._strip_comments(' '.join(tokens[3:]))
 
         column_type_ch = self.convert_field_type(column_type_mysql, column_type_mysql_parameters)
 
@@ -1190,21 +1406,27 @@ class MysqlToClickhouseConverter:
             mysql_table_structure: TableStructure = table_structure[0]
             ch_table_structure: TableStructure = table_structure[1]
 
-            current_column_type_ch = ch_table_structure.get_field(column_name).field_type
+            current_field = ch_table_structure.get_field(column_name)
+            current_column_type_ch = current_field.field_type
             target_table_name = self.db_replicator.get_target_table_name(table_name)
             on_cluster = self.db_replicator.clickhouse_api.get_on_cluster_clause()
 
-            if current_column_type_ch != column_type_ch:
+            # CHANGE COLUMN redefines the column, so a comment-only change has to
+            # be pushed through even when the type is unchanged.
+            if current_column_type_ch != column_type_ch or current_field.comment != comment:
 
                 mysql_table_structure.update_field(
-                    TableField(name=column_name, field_type=column_type_mysql),
+                    TableField(name=column_name, field_type=column_type_mysql, comment=comment),
                 )
 
                 ch_table_structure.update_field(
-                    TableField(name=column_name, field_type=column_type_ch),
+                    TableField(name=column_name, field_type=column_type_ch, comment=comment),
                 )
 
-                query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} MODIFY COLUMN {column_name} {column_type_ch}'
+                query = (
+                    f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} '
+                    f'MODIFY COLUMN {column_name} {column_type_ch}{modify_comment_clause(comment)}'
+                )
                 self.db_replicator.clickhouse_api.execute_command(query)
 
             if column_name != new_column_name:
@@ -1495,9 +1717,14 @@ class MysqlToClickhouseConverter:
         return ''.join(result)
 
     def parse_mysql_table_structure(self, create_statement, required_table_name=None):
+        # Comments have to be collected before they are stripped, since they may
+        # contain characters (commas above all) that would otherwise break the
+        # statement into the wrong columns.
+        column_comments, table_comment = extract_create_table_comments(create_statement)
         create_statement = self._strip_comments(create_statement)
 
         structure = TableStructure()
+        structure.comment = table_comment
 
         tokens = sqlparse.parse(create_statement.replace('\n', ' ').strip())[0].tokens
         tokens = [t for t in tokens if not t.is_whitespace and not t.is_newline]
@@ -1632,6 +1859,7 @@ class MysqlToClickhouseConverter:
                 field_type=field_type,
                 parameters=field_parameters,
                 additional_data=additional_data,
+                comment=column_comments.get(field_name, ''),
             ))
             #print(' ---- params:', field_parameters)
 

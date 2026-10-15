@@ -47,6 +47,7 @@ With a focus on high performance, it utilizes batching heavily and uses C++ exte
 - **Recovery without Downtime**: Allows for preserving old data while performing initial replication, ensuring continuous operation.
 - **Correct Data Removal**: Unlike MaterializedMySQL, `mysql_ch_replicator` ensures physical removal of data.
 - **Comprehensive Data Type Support**: Accurately replicates most data types, including JSON, booleans, and more. Easily extensible for additional data types.
+- **Table and Column Comments**: MySQL `COMMENT` clauses are recreated as ClickHouse table and column comments (visible in `system.tables` / `system.columns` and in the ClickHouse UI). Comments are carried by both table creation and `ALTER TABLE ADD`/`MODIFY`/`CHANGE COLUMN`; as in MySQL, a `MODIFY`/`CHANGE` that omits `COMMENT` clears the existing one.
 - **Multi-Database Handling**: Replicates the binary log once for all databases, optimizing the process compared to `MaterializedMySQL`, which replicates the log separately for each database.
 
 ## Installation

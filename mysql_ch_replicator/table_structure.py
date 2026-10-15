@@ -8,6 +8,7 @@ class TableField:
     field_type: str = ''
     parameters: str = ''
     additional_data: Any = None
+    comment: str = ''
 
 @dataclass
 class TableStructure:
@@ -18,6 +19,7 @@ class TableStructure:
     charset: str = ''
     charset_python: str = ''
     if_not_exists: bool = False
+    comment: str = ''
 
     def preprocess(self):
         field_names = [f.name for f in self.fields]

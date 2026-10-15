@@ -26,6 +26,30 @@ def is_optimizable_table_engine(engine: str) -> bool:
     return engine not in NON_OPTIMIZABLE_TABLE_ENGINES
 
 
+def escape_clickhouse_string(value: str) -> str:
+    """Quote a value for a ClickHouse string literal."""
+    return value.replace('\\', '\\\\').replace("'", "\\'")
+
+
+def comment_clause(comment: str) -> str:
+    """Render a MySQL COMMENT as a ClickHouse COMMENT clause, if there is one."""
+    if not comment:
+        return ''
+    return f" COMMENT '{escape_clickhouse_string(comment)}'"
+
+
+def modify_comment_clause(comment: str) -> str:
+    """
+    Render the COMMENT clause of `ALTER TABLE ... MODIFY/CHANGE COLUMN`.
+
+    MySQL replaces the whole column definition, so a MODIFY that leaves COMMENT
+    out drops the existing comment. ClickHouse keeps it instead, so an empty
+    COMMENT is emitted explicitly to mirror MySQL. The clause must follow the
+    DEFAULT clause, which is the only order ClickHouse accepts.
+    """
+    return f" COMMENT '{escape_clickhouse_string(comment)}'"
+
+
 CREATE_TABLE_QUERY = '''
 CREATE TABLE {if_not_exists} `{db_name}`.`{table_name}` {on_cluster}
 (
@@ -35,7 +59,7 @@ CREATE TABLE {if_not_exists} `{db_name}`.`{table_name}` {on_cluster}
 )
 {engine}
 {partition_by}ORDER BY {primary_key}
-SETTINGS index_granularity = 8192
+SETTINGS index_granularity = 8192{table_comment}
 '''
 
 CREATE_DIST_TABLE_QUERY = '''
@@ -258,7 +282,8 @@ class ClickhouseApi:
             raise Exception(f'missing primary key for {structure.table_name}')
 
         fields = [
-            f'    `{field.name}` {field.field_type}' for field in structure.fields
+            f'    `{field.name}` {field.field_type}{comment_clause(field.comment)}'
+            for field in structure.fields
         ]
         fields = ',\n'.join(fields)
 
@@ -316,6 +341,7 @@ class ClickhouseApi:
             'engine': engine,
             'partition_by': partition_by,
             'indexes': indexes,
+            'table_comment': comment_clause(structure.comment),
         })
 
         queries.insert(0, query) # in case of cluster mode we need to create Replicated Table first before Distributed one
