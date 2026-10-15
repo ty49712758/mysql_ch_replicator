@@ -103,28 +103,23 @@ class RowsEvent(BinLogEvent):
 
     def _convert_timestamp_with_timezone(self, timestamp_value):
         """
-        Convert timestamp from UTC to configured timezone
+        Convert a MySQL TIMESTAMP into a timezone-aware datetime.
 
-        :param timestamp_value: Unix timestamp value
-        :return: datetime object in configured timezone
+        MySQL stores TIMESTAMP columns as a UTC unix timestamp, which is what the
+        binlog carries. Turn it into an aware datetime in mysql_timezone so that
+        it is consistent with what the MySQL client returns for the initial
+        replication (there the server converts the value using the session
+        time_zone, which is set to mysql_timezone).
+
+        :param timestamp_value: Unix timestamp value (UTC)
+        :return: timezone-aware datetime in the configured timezone
         """
-        # Create UTC datetime first
-        utc_dt = datetime.datetime.utcfromtimestamp(timestamp_value)
-        
-        # If timezone is UTC, return timezone-aware UTC datetime
-        if self.mysql_timezone == "UTC":
-            return utc_dt.replace(tzinfo=datetime.timezone.utc)
-        
-        # Convert to configured timezone but keep timezone-aware
+        utc_dt = datetime.datetime.fromtimestamp(timestamp_value, tz=datetime.timezone.utc)
         try:
-            # Start with UTC timezone-aware datetime
-            utc_dt_aware = utc_dt.replace(tzinfo=datetime.timezone.utc)
-            # Convert to target timezone
-            target_tz = zoneinfo.ZoneInfo(self.mysql_timezone)
-            return utc_dt_aware.astimezone(target_tz)
-        except zoneinfo.ZoneInfoNotFoundError:
+            return utc_dt.astimezone(zoneinfo.ZoneInfo(self.mysql_timezone))
+        except (zoneinfo.ZoneInfoNotFoundError, ValueError):
             # If timezone is invalid, fall back to UTC
-            return utc_dt.replace(tzinfo=datetime.timezone.utc)
+            return utc_dt
 
     def _read_column_data(self, cols_bitmap, row_image_type=None):
         """Use for WRITE, UPDATE and DELETE events.
@@ -260,7 +255,7 @@ class RowsEvent(BinLogEvent):
                 self.__none_sources[name] = NONE_SOURCE.OUT_OF_DATE_RANGE
             return ret
         elif column.type == FIELD_TYPE.TIMESTAMP:
-            return datetime.datetime.utcfromtimestamp(self.packet.read_uint32())
+            return self._convert_timestamp_with_timezone(self.packet.read_uint32())
 
         # For new date format:
         elif column.type == FIELD_TYPE.DATETIME2:
@@ -272,7 +267,7 @@ class RowsEvent(BinLogEvent):
             return self.__read_time2(column)
         elif column.type == FIELD_TYPE.TIMESTAMP2:
             return self.__add_fsp_to_time(
-                datetime.datetime.utcfromtimestamp(self.packet.read_int_be_by_size(4)),
+                self._convert_timestamp_with_timezone(self.packet.read_int_be_by_size(4)),
                 column,
             )
         elif column.type == FIELD_TYPE.LONGLONG:
