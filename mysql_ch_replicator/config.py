@@ -163,6 +163,16 @@ class BinlogReplicatorSettings:
     data_dir: str = 'binlog'
     records_per_file: int = 100000
     binlog_retention_period: int = 43200  # 12 hours in seconds
+    # Timeout (seconds) for establishing the connection to MySQL. Left unset,
+    # pymysql's own default (10 seconds) applies. Raise it on a slow or flaky
+    # link - a too small value makes the replicator log
+    # `OperationalError (2003, "Can't connect to MySQL server ... (timed out)")`
+    # and reconnect, even though the server is only slow to accept.
+    connect_timeout: int | None = None
+    # Interval (seconds) between heartbeats the master sends on the binlog
+    # stream. Left unset, no heartbeat is requested, so an idle connection can
+    # be dropped silently by a firewall or NAT in between.
+    heartbeat: int | None = None
 
     def validate(self):
         if not isinstance(self.data_dir, str):
@@ -179,6 +189,18 @@ class BinlogReplicatorSettings:
 
         if self.binlog_retention_period <= 0:
             raise ValueError('binlog_replicator binlog_retention_period should be positive')
+
+        if self.connect_timeout is not None:
+            if not isinstance(self.connect_timeout, int):
+                raise ValueError(f'binlog_replicator connect_timeout should be int and not {stype(self.connect_timeout)}')
+            if self.connect_timeout <= 0:
+                raise ValueError('binlog_replicator connect_timeout should be positive')
+
+        if self.heartbeat is not None:
+            if not isinstance(self.heartbeat, int):
+                raise ValueError(f'binlog_replicator heartbeat should be int and not {stype(self.heartbeat)}')
+            if self.heartbeat <= 0:
+                raise ValueError('binlog_replicator heartbeat should be positive')
 
 
 class Settings:

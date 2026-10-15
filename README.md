@@ -233,6 +233,8 @@ binlog_replicator:
   data_dir: '/home/user/binlog/'  # a new EMPTY directory (for internal storage of data by mysql_ch_replicator itself)
   records_per_file: 100000
   binlog_retention_period: 43200  # optional, how long to keep binlog files in seconds, default 12 hours
+  connect_timeout: 30             # optional, seconds to wait for the MySQL connection (default: pymysql's 10)
+  heartbeat: 30                   # optional, seconds between binlog stream heartbeats (unset by default)
 
 databases: 'database_name_pattern_*'
 tables: '*'
@@ -310,6 +312,8 @@ version_initial_value: 0  # optional, initial value for _version column (default
 - `enable_optimize_final` - (enabled by default) It forces ClickHouse to merge all active parts into a single part, even if large merges have already occurred. Although clickhouse documentation does NOT recommend this but we have observed [performance degradation](https://github.com/bakwc/mysql_ch_replicator/pull/223#discussion_r2659007677) and hence decided to enable it by default. Read more: https://clickhouse.com/docs/optimize/avoidoptimizefinal. You can turn it off.
 - `auto_restart_interval` - interval (seconds) between automatic db_replicator restart. Default 3600 (1 hour). This is done to reduce memory usage.
 - `binlog_retention_period` - how long to keep binlog files in seconds. Default 43200 (12 hours). This setting controls how long the local binlog files are retained before being automatically cleaned up.
+- `connect_timeout` - seconds to wait for the connection to MySQL while streaming the binlog. Unset by default, in which case pymysql's own default (10 seconds) applies. Raise it on a slow or flaky link: a value that is too small makes the replicator log `OperationalError (2003, "Can't connect to MySQL server ... (timed out)")` and reconnect even though the server is only slow to accept the connection. Such errors are retried automatically, so they are noisy rather than fatal.
+- `heartbeat` - seconds between the heartbeats the master sends on the binlog stream. Unset by default, so no heartbeat is requested and an idle connection may be dropped silently by a firewall or NAT in between. Values around 30 are reasonable. Note that the effective period is capped at half of the connection's `read_timeout`.
 - `indexes` - you may want to add some indexes to accelerate performance, eg. ngram index for full-test search, etc. To apply indexes you need to start replication from scratch.
 - `partition_bys` - custom PARTITION BY expressions for tables. Tables are created **without** a partition key unless a rule matches here. There is no default: a partition key that is not tied to the data volume cannot be chosen automatically, and a common choice such as `intDiv(<pk>, 4294967)` would put a 64-bit key (e.g. a snowflake id) in one partition per row — ClickHouse then rejects the INSERT with `TOO_MANY_PARTS`. Rules are matched in order and the first hit wins, so declare specific rules before catch-all ones; a rule is skipped when the column it references is missing from the table or is `Nullable`, which lets a single `tables: '*'` rule cover a whole database. Useful for time-based partitioning like `toYYYYMM(created_at)`.
 - `order_bys` - custom ORDER BY expressions for tables. By default uses the MySQL primary key(s). Useful for optimizing query patterns, e.g., `created_at, id` for time-series data.

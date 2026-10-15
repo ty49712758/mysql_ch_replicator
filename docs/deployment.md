@@ -191,6 +191,20 @@ optimize_interval: 86400            # 定期 OPTIMIZE,避免存储膨胀
 auto_restart_interval: 3600         # 定期重启降内存
 ```
 
+跨网络(尤其是跨 NAT / 防火墙)连 MySQL 时,建议在 `binlog_replicator` 下补上这两项:
+
+```yaml
+binlog_replicator:
+  connect_timeout: 30   # 建立 MySQL 连接的等待秒数;不设则用 pymysql 默认的 10 秒
+  heartbeat: 30         # binlog 流心跳间隔(秒);不设则不请求心跳
+```
+
+- `connect_timeout` 太小会导致日志反复出现
+  `OperationalError (2003, "Can't connect to MySQL server ... (timed out)")` —— 服务端只是"接受得慢"时也会被判超时。
+  这类错误会被自动重试(见 [9.8](#98-operational-error-2003-反复出现)),不会致命,但会刷屏。
+- `heartbeat` 用于保活:不设心跳时,空闲的 binlog 连接可能被中间的防火墙 / NAT 悄悄回收。30 秒左右是常用值。
+  实际生效周期会被限制在连接 `read_timeout` 的一半以内。
+
 ### 4.4 分区键
 
 ClickHouse 表的分区键在**建表时确定,之后无法修改**,所以要在第一次初始复制之前配置好。
@@ -518,3 +532,47 @@ ClickHouse 的启动、写入、查询都会严重退化。
 
 另:日志中出现 `Database xxx does not exist. Maybe you meant xxx_tmp?` 是**正常的** ——
 初始复制期间数据先写入 `_tmp` 库,全部完成后才切换。
+
+### 9.8 `operational error (2003...)` 反复出现
+
+```
+ERROR] operational error (2003, "Can't connect to MySQL server on '10.x.x.x' (timed out)")
+```
+
+**这是被自动处理并恢复的,不是故障。** `binlog_replicator` 对 `OperationalError` 的处理是:
+记一条 ERROR 日志 → 睡 15 秒 → 重连 → 从已保存的 binlog 位点续读。判断方法很简单:
+错误之后日志里应很快出现
+
+```
+[binlogrepl ...] last transaction id: ('mysql-bin.000xxx', <pos>), processed events: <n>
+```
+
+且 `<n>` 持续增长。
+
+> 区分:`operational error` 是预期内的自愈路径;若打的是 `unhandled error`,那才会让进程退出(由父进程
+> `runner` 重启),才需要真正排查。
+
+`(2003 ... timed out)` 是** TCP 握手超时**,属于网络层,不是认证失败也不是 SQL 出错。常见原因:网络抖动、
+防火墙 / NAT 回收空闲连接、MySQL 服务端繁忙、WSL2 的 NAT 转发不稳定。工具未设置 `connect_timeout` 时
+用的是 pymysql 默认的 **10 秒**。
+
+**偶发一次不用处理。** 频繁出现时才需要:
+
+1. **放宽超时、开启心跳**(见 [4.3](#43-其它生产建议)):
+   ```yaml
+   binlog_replicator:
+     connect_timeout: 30
+     heartbeat: 30
+   ```
+2. 排查链路与负载:
+   ```bash
+   ping -c 100 <mysql_host>
+   grep -c "operational error" /var/lib/mysql-ch-replicator/data/binlog_replicator.log
+   ```
+   MySQL 侧看 `SHOW PROCESSLIST`、`max_connections`、当前连接数。
+3. 让复制进程离 MySQL 更近 —— 从 WSL 隔 NAT 连生产库本身就不稳,按本文档部署到同网段服务器上会明显改善。
+
+**关于数据安全**:位点每次都会持久化,重连后从正确位置续读,不丢数据;目标表是
+`ReplacingMergeTree(_version)`,即使个别事件重复投递也会被 `FINAL` 去重。唯一需要警惕的是
+**中断时间超过 MySQL 的 `binlog_expire_logs_seconds`** —— 服务器上的 binlog 被清理后续读会失败,
+届时要重做初始复制。

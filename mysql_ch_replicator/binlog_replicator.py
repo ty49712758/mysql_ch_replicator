@@ -353,6 +353,8 @@ class BinlogReplicator:
             'passwd': self.mysql_settings.password,
             'charset': self.mysql_settings.charset,
         }
+        if self.replicator_settings.connect_timeout is not None:
+            mysql_settings['connect_timeout'] = self.replicator_settings.connect_timeout
         self.data_writer = DataWriter(self.replicator_settings)
         self.state = State(os.path.join(self.replicator_settings.data_dir, 'state.json'))
         logger.info(f'state start position: {self.state.prev_last_seen_transaction}')
@@ -369,6 +371,7 @@ class BinlogReplicator:
             log_pos=log_pos,
             log_file=log_file,
             mysql_timezone=settings.mysql_timezone,
+            slave_heartbeat=self.replicator_settings.heartbeat,
         )
         self.last_state_update = 0
         self.last_binlog_clear_time = 0

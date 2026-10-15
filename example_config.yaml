@@ -19,6 +19,8 @@ clickhouse:
 binlog_replicator:
   data_dir: '/home/user/binlog/'
   records_per_file: 100000
+  # connect_timeout: 30   # seconds to wait for the MySQL connection (default: pymysql's 10)
+  # heartbeat: 30         # seconds between binlog stream heartbeats (unset by default)
 
 databases: 'database_name_pattern_*'
 
