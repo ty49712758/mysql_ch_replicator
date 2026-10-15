@@ -4,6 +4,7 @@ import uuid
 import sqlparse
 import re
 import datetime
+import zoneinfo
 from pyparsing import Suppress, CaselessKeyword, Word, alphas, alphanums, delimitedList
 import copy
 
@@ -635,6 +636,28 @@ class MysqlToClickhouseConverter:
             clickhouse_field_value = mysql_field_value
             mysql_field_type = mysql_field_types[idx]
             clickhouse_field_type = clickhouse_field_types[idx]
+
+            # Make naive date/time values aware using the configured
+            # mysql_timezone. Realtime (binlog) rows carry naive datetimes, and
+            # clickhouse-connect would otherwise compute the epoch from the local
+            # timezone of the host process. That silently shifts every value by
+            # the difference between the host timezone and mysql_timezone (e.g.
+            # +8h when the replicator runs in a UTC container while MySQL and
+            # ClickHouse are in Asia/Shanghai). Initial replication already
+            # returns aware datetimes, which are left untouched.
+            if (
+                isinstance(clickhouse_field_value, datetime.datetime)
+                and clickhouse_field_value.tzinfo is None
+                and self.db_replicator is not None
+                and (
+                    mysql_field_type.startswith('datetime')
+                    or mysql_field_type.startswith('timestamp')
+                )
+            ):
+                clickhouse_field_value = clickhouse_field_value.replace(
+                    tzinfo=zoneinfo.ZoneInfo(self.db_replicator.config.mysql_timezone),
+                )
+
             if mysql_field_type.startswith('time') and 'String' in clickhouse_field_type:
                 clickhouse_field_value = str(mysql_field_value)
             if mysql_field_type == 'json' and 'String' in clickhouse_field_type:
