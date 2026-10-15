@@ -191,6 +191,66 @@ optimize_interval: 86400            # 定期 OPTIMIZE,避免存储膨胀
 auto_restart_interval: 3600         # 定期重启降内存
 ```
 
+### 4.4 分区键
+
+ClickHouse 表的分区键在**建表时确定,之后无法修改**,所以要在第一次初始复制之前配置好。
+
+**默认不分区。** 自动建表时不会生成 `PARTITION BY`,除非你在配置里显式指定 ——
+每个表都是单分区。
+
+之所以不设默认值:分区键无法脱离数据量自动选择。曾经用的 `intDiv(<主键>, 4294967)`
+是按 32 位自增主键设计的,遇到 **64 位主键(雪花 ID)** 时 id 空间过大且稀疏,会变成
+**几乎每行一个分区**;初始复制时一个批次(默认 5 万行)就跨越上亿个分区,ClickHouse 直接以
+`Code: 252 ... TOO_MANY_PARTS: Too many partitions for single INSERT block (more than 100)` 拒绝写入,
+子进程反复重启。而对 64 位 id 也**不存在"合适的除数"** —— 要让单批落在 100 个分区以内,除数得取到
+1e13 量级,可全表又会变成十几万个分区。
+
+所以需要分区时,请按业务时间列显式配置:
+
+```yaml
+partition_bys:
+  # 规则按顺序匹配,create_table 取「第一条命中」的表达式 -> 特殊规则在前,兜底在后
+  - databases: '*'
+    tables: '*'
+    partition_by: 'toYYYYMM(created)'
+```
+
+**规则是「条件生效」的**:表达式引用的列如果在某张表中**不存在**,或该列是 **Nullable**,
+这条规则会被**自动跳过**,继续匹配下一条。因此:
+
+- **一条 `tables: '*'` 的全局规则即可覆盖全库** —— 有非空 `created` 的表按月分区,没有的表自动退回单分区。
+  不需要逐表列举。
+- 顺带规避了 `Partition key contains nullable columns` —— ClickHouse 不允许用可空列做分区键。
+
+个别表想用别的列,把它写在更靠前的位置:
+
+```yaml
+partition_bys:
+  - databases: '*'
+    tables: ['analysis_inventory_flow_*', 'imspc_inventory_flow_*']
+    partition_by: 'toYYYYMM(bus_time)'    # 业务时间列
+  - databases: '*'
+    tables: '*'
+    partition_by: 'toYYYYMM(created)'     # 兜底:建表时间
+  # 没有任何时间列的表会自动退回「不分区」,无需显式配置
+```
+
+> 分区键只影响**新建**的表。改了配置之后,必须删掉目标库(或初始复制中的 `_tmp` 库)和 `data_dir`
+> 中的状态重新做初始复制,新分区键才会生效。
+
+**验证**:
+
+```sql
+SHOW CREATE TABLE bjkr_20260605.analysis_inventory_flow_2022;
+-- 期望能看到:PARTITION BY toYYYYMM(created)
+```
+
+同时确认单批分区数上限(默认 100):
+
+```sql
+SELECT name, value FROM system.settings WHERE name = 'max_partitions_per_insert_block';
+```
+
 ---
 
 ## 5. systemd 常驻
@@ -440,3 +500,21 @@ systemctl show -p Environment mysql-ch-replicator
 ```
 
 > 这只影响日志显示。若**数据本身**有偏移,请检查 `mysql_timezone` 是否与 MySQL/ClickHouse 服务端时区一致。
+
+### 9.7 `Code: 252 ... TOO_MANY_PARTS`
+
+```
+DB::Exception: Too many partitions for single INSERT block (more than 100).
+The limit is controlled by 'max_partitions_per_insert_block' setting. (TOO_MANY_PARTS)
+```
+
+单个 INSERT 批次落在了超过 100 个分区里。常见于**主键是 64 位雪花 ID** 的表。
+
+**不要**通过调大 `max_partitions_per_insert_block` 来解决 —— 那会让表最终积累上亿个分区,
+ClickHouse 的启动、写入、查询都会严重退化。
+
+请按 [4.4 分区键](#44-分区键) 配置 `partition_bys`(通常一条 `toYYYYMM(created)` 的全局规则即可),
+然后删掉目标库和 `data_dir` 状态重新做初始复制。已按错误分区键建好的表不会被自动修正,必须重建。
+
+另:日志中出现 `Database xxx does not exist. Maybe you meant xxx_tmp?` 是**正常的** ——
+初始复制期间数据先写入 `_tmp` 库,全部完成后才切换。

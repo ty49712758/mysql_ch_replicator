@@ -206,7 +206,9 @@ class DbReplicatorRealtime:
         ch_structure.table_name = target_table_name
         self.replicator.state.tables_structure[mysql_structure.table_name] = (mysql_structure, ch_structure)
         indexes = self.replicator.config.get_indexes(self.replicator.database, mysql_structure.table_name)
-        partition_bys = self.replicator.config.get_partition_bys(self.replicator.database, mysql_structure.table_name)
+        partition_bys = self.replicator.config.get_partition_bys(
+            self.replicator.database, mysql_structure.table_name, ch_structure,
+        )
         self.replicator.clickhouse_api.create_table(ch_structure, additional_indexes=indexes, additional_partition_bys=partition_bys)
 
     def handle_drop_table_query(self, query, db_name):

@@ -77,7 +77,9 @@ class DbReplicatorInitial:
         
         self.replicator.state.tables_structure[table_name] = (mysql_structure, clickhouse_structure)
         indexes = self.replicator.config.get_indexes(self.replicator.database, table_name)
-        partition_bys = self.replicator.config.get_partition_bys(self.replicator.database, table_name)
+        partition_bys = self.replicator.config.get_partition_bys(
+            self.replicator.database, table_name, clickhouse_structure,
+        )
         order_bys = self.replicator.config.get_order_bys(self.replicator.database, table_name)
 
         if not self.replicator.is_parallel_worker:

@@ -1,4 +1,5 @@
 import os
+import re
 import yaml
 import fnmatch
 import zoneinfo
@@ -47,6 +48,56 @@ class PartitionBy:
     databases: str | list = '*'
     tables: str | list = '*'
     partition_by: str = ''
+
+
+# A bare identifier (or a `backtick quoted` one). Function names are told apart
+# from column references by looking at what follows the identifier.
+_IDENTIFIER_RE = re.compile(r'`([^`]+)`|([A-Za-z_][A-Za-z0-9_]*)')
+
+
+def referenced_columns(expression: str) -> list:
+    """
+    Return the identifiers of `expression` that look like column references.
+
+    Function names (identifiers immediately followed by an opening parenthesis)
+    and string literals are ignored, so `toYYYYMM(created)` yields
+    `['created']` while `tuple()` yields `[]`.
+    """
+    without_literals = re.sub(r"'[^']*'", "''", expression)
+    columns = []
+    for match in _IDENTIFIER_RE.finditer(without_literals):
+        quoted, bare = match.group(1), match.group(2)
+        if quoted is None:
+            # A bare identifier followed by '(' is a function call.
+            rest = without_literals[match.end():].lstrip()
+            if rest.startswith('('):
+                continue
+            columns.append(bare)
+        else:
+            columns.append(quoted)
+    return columns
+
+
+def partition_by_applies(expression: str, structure) -> bool:
+    """
+    Check that a custom partition_by can be used for `structure`.
+
+    A partition key may reference neither a missing column (ClickHouse fails
+    with "Unknown identifier") nor a Nullable one (it fails with "Partition key
+    contains nullable columns"). Rules that do not apply are skipped, so a
+    single catch-all rule such as `toYYYYMM(created)` can be configured for a
+    whole database without listing every table individually.
+    """
+    if structure is None:
+        return True
+    field_types = {field.name: field.field_type for field in structure.fields}
+    for column in referenced_columns(expression):
+        field_type = field_types.get(column)
+        if field_type is None:
+            return False
+        if field_type.startswith('Nullable('):
+            return False
+    return True
 
 
 @dataclass
@@ -307,12 +358,14 @@ class Settings:
             results.append(index.index)
         return results
 
-    def get_partition_bys(self, db_name, table_name):
+    def get_partition_bys(self, db_name, table_name, structure=None):
         results = []
         for partition_by in self.partition_bys:
             if not self.is_pattern_matches(db_name, partition_by.databases):
                 continue
             if not self.is_pattern_matches(table_name, partition_by.tables):
+                continue
+            if not partition_by_applies(partition_by.partition_by, structure):
                 continue
             results.append(partition_by.partition_by)
         return results

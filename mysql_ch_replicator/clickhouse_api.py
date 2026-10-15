@@ -261,17 +261,17 @@ class ClickhouseApi:
             f'    `{field.name}` {field.field_type}' for field in structure.fields
         ]
         fields = ',\n'.join(fields)
-        partition_by = ''
 
-        # Check for custom partition_by first
+        # Tables are created without a partition key unless `partition_bys`
+        # configures one. There is no sensible default: spreading a 64-bit key
+        # such as a snowflake id with intDiv() would create one partition per
+        # row (ClickHouse then rejects the INSERT with TOO_MANY_PARTS), and a key
+        # that is not tied to the data volume cannot be chosen automatically. A
+        # single unpartitioned part is always valid, so that is the default.
+        partition_by = ''
         if additional_partition_bys:
-            # Use the first custom partition_by if available
+            # Use the first matching custom partition_by
             partition_by = f'PARTITION BY {additional_partition_bys[0]}\n'
-        else:
-            # Fallback to default logic
-            if len(structure.primary_keys) == 1:
-                if 'int' in structure.fields[structure.primary_key_ids[0]].field_type.lower():
-                    partition_by = f'PARTITION BY intDiv({structure.primary_keys[0]}, 4294967)\n'
 
         indexes = [
             'INDEX _version _version TYPE minmax GRANULARITY 1',

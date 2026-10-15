@@ -21,3 +21,20 @@ binlog_replicator:
   records_per_file: 100000
 
 databases: 'database_name_pattern_*'
+
+# Partition key for the ClickHouse tables. Tables are created WITHOUT a
+# partition key unless configured here - a default such as intDiv(<pk>, 4294967)
+# would put a 64-bit key (e.g. a snowflake id) in one partition per row and
+# ClickHouse would reject the INSERT with TOO_MANY_PARTS.
+#
+# Rules are matched in order and create_table uses the first hit; a rule is
+# skipped when the column it references is missing from the table or is
+# Nullable, so a single catch-all rule works for a whole database.
+#
+# partition_bys:
+#   - databases: '*'
+#     tables: ['orders_*', 'events_*']
+#     partition_by: 'toYYYYMM(bus_time)'   # business time
+#   - databases: '*'
+#     tables: '*'
+#     partition_by: 'toYYYYMM(created)'    # fallback: creation time
