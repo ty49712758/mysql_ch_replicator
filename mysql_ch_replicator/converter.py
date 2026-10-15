@@ -579,12 +579,26 @@ class MysqlToClickhouseConverter:
             clickhouse_type = f'Nullable({clickhouse_type})'
         return clickhouse_type
 
+    @staticmethod
+    def strip_nullable_type(clickhouse_type: str) -> str:
+        if clickhouse_type.startswith('Nullable(') and clickhouse_type.endswith(')'):
+            return clickhouse_type[len('Nullable('):-1]
+        return clickhouse_type
+
     def convert_table_structure(self, mysql_structure: TableStructure) -> TableStructure:
         clickhouse_structure = TableStructure()
         clickhouse_structure.table_name = mysql_structure.table_name
         clickhouse_structure.if_not_exists = mysql_structure.if_not_exists
+        primary_keys = set(mysql_structure.primary_keys)
         for field in mysql_structure.fields:
             clickhouse_field_type = self.convert_field_type(field.field_type, field.parameters)
+            # MySQL primary key columns are implicitly NOT NULL, but the raw
+            # CREATE TABLE statement taken from the binlog does not always spell
+            # that out (SHOW CREATE TABLE does). Force them to be non-nullable so
+            # the ClickHouse ORDER BY / PARTITION BY keys never contain a Nullable
+            # column, which ClickHouse rejects unless allow_nullable_key is enabled.
+            if field.name in primary_keys:
+                clickhouse_field_type = self.strip_nullable_type(clickhouse_field_type)
             clickhouse_structure.fields.append(TableField(
                 name=field.name,
                 field_type=clickhouse_field_type,

@@ -185,3 +185,61 @@ ORDER BY id
     
     ch.drop_table('test_structure_table')
     ch.drop_database('test_db')
+
+
+def test_primary_key_is_never_nullable():
+    """
+    Primary key columns must be converted to non-nullable ClickHouse types.
+
+    A CREATE TABLE statement taken from the binlog does not spell out the
+    implicit NOT NULL that MySQL applies to primary key columns (unlike SHOW
+    CREATE TABLE). Without this normalization the ClickHouse ORDER BY /
+    PARTITION BY key would contain a Nullable column and table creation would
+    fail with:
+    DB::Exception: Partition key contains nullable columns, but merge tree
+    setting `allow_nullable_key` is disabled. (ILLEGAL_COLUMN)
+    """
+    converter = MysqlToClickhouseConverter()
+
+    binlog_style = (
+        'CREATE TABLE `t` '
+        '(`id` int, `name` varchar(10), PRIMARY KEY (`id`)) ENGINE=InnoDB'
+    )
+    mysql_structure = converter.parse_mysql_table_structure(binlog_style)
+    clickhouse_structure = converter.convert_table_structure(mysql_structure)
+
+    field_types = {f.name: f.field_type for f in clickhouse_structure.fields}
+    assert field_types['id'] == 'Int32'
+    assert field_types['name'] == 'Nullable(String)'
+
+
+def test_fallback_id_primary_key_is_non_nullable():
+    """
+    When a table has no explicit primary key the replicator falls back to the
+    `id` column. That column must also be non-nullable, otherwise table
+    creation fails with the nullable partition key error.
+    """
+    converter = MysqlToClickhouseConverter()
+
+    no_pk = 'CREATE TABLE `t` (`id` int, `name` varchar(10)) ENGINE=InnoDB'
+    mysql_structure = converter.parse_mysql_table_structure(no_pk)
+    clickhouse_structure = converter.convert_table_structure(mysql_structure)
+
+    field_types = {f.name: f.field_type for f in clickhouse_structure.fields}
+    assert field_types['id'] == 'Int32'
+
+
+def test_composite_primary_key_is_non_nullable():
+    converter = MysqlToClickhouseConverter()
+
+    ddl = (
+        'CREATE TABLE `t` '
+        '(`a` int, `b` int, `c` int, PRIMARY KEY (`a`, `b`)) ENGINE=InnoDB'
+    )
+    mysql_structure = converter.parse_mysql_table_structure(ddl)
+    clickhouse_structure = converter.convert_table_structure(mysql_structure)
+
+    field_types = {f.name: f.field_type for f in clickhouse_structure.fields}
+    assert field_types['a'] == 'Int32'
+    assert field_types['b'] == 'Int32'
+    assert field_types['c'] == 'Nullable(Int32)'
