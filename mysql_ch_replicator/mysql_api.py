@@ -4,8 +4,58 @@ import zoneinfo
 
 import mysql.connector
 
+from logging import getLogger
+
 from .config import MysqlSettings
 from .table_structure import TableStructure, TableField
+
+
+logger = getLogger(__name__)
+
+
+def format_utc_offset(offset: datetime.timedelta) -> str:
+    """Format a UTC offset as a MySQL numeric time zone, e.g. '-05:30'."""
+    total_seconds = int(offset.total_seconds())
+    sign = '-' if total_seconds < 0 else '+'
+    total_seconds = abs(total_seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes = remainder // 60
+    return f'{sign}{hours:02d}:{minutes:02d}'
+
+
+def set_session_time_zone(cursor, mysql_timezone: str):
+    """
+    Set the MySQL session time zone, so that MySQL returns TIMESTAMP values in
+    mysql_timezone.
+
+    Named time zones (e.g. 'Asia/Shanghai') are only known to the server when
+    its time zone tables (mysql.time_zone*) have been populated. When they are
+    not, MySQL rejects the statement with error 1298. Fall back to the
+    equivalent numeric offset (e.g. '+08:00'), which the server always
+    understands, so that replication does not fail on servers that simply have
+    no time zone tables loaded.
+    """
+    try:
+        cursor.execute(f"SET time_zone = '{mysql_timezone}'")
+        return
+    except mysql.connector.errors.DatabaseError as e:
+        if e.errno != 1298:
+            raise
+
+    logger.warning(
+        f'MySQL server does not recognize the time zone "{mysql_timezone}" '
+        f'(error 1298 - its time zone tables are most likely not populated). '
+        f'Falling back to a numeric UTC offset.',
+    )
+
+    offset = datetime.datetime.now(zoneinfo.ZoneInfo(mysql_timezone)).utcoffset()
+    offset_str = format_utc_offset(offset)
+    logger.warning(
+        f'Using session time_zone = "{offset_str}" instead of "{mysql_timezone}". '
+        f'The offset is fixed, so daylight saving transitions will not be applied. '
+        f'Populate the MySQL time zone tables to use the named time zone.',
+    )
+    cursor.execute(f"SET time_zone = '{offset_str}'")
 
 
 class MySQLApi:
@@ -48,10 +98,10 @@ class MySQLApi:
             else:
                 raise
         self.cursor = self.db.cursor()
-        
+
         if self.mysql_timezone and self.mysql_timezone != 'UTC':
-            self.cursor.execute(f"SET time_zone = '{self.mysql_timezone}'")
-        
+            set_session_time_zone(self.cursor, self.mysql_timezone)
+
         if self.database is not None:
             self.cursor.execute(f'USE `{self.database}`')
         self.last_connect_time = curr_time
