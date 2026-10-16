@@ -484,5 +484,24 @@ def test_execute_ddl_command_reraises_other_errors(monkeypatch):
         code=60,
     ))
 
-    with pytest.raises(DatabaseError):
+    with pytest.raises(DatabaseError) as excinfo:
         api.execute_ddl_command('ALTER TABLE `db`.`t` ADD COLUMN `c` Int32')
+
+    # ClickHouse does not name the table in its own message, so the failing
+    # query is appended to make the error actionable.
+    assert '`db`.`t`' in str(excinfo.value)
+
+
+def test_ddl_already_applied_warning_names_the_table(monkeypatch, caplog):
+    api = _ddl_api(monkeypatch, DatabaseError(
+        'Code: 15. DB::Exception: Cannot add column `shard_id`: '
+        'column with this name already exists. (DUPLICATE_COLUMN)',
+        code=15,
+    ))
+
+    with caplog.at_level('WARNING'):
+        api.execute_ddl_command(
+            'ALTER TABLE `shop`.`orders` ADD COLUMN IF NOT EXISTS `shard_id` Int64',
+        )
+
+    assert '`shop`.`orders`' in caplog.text

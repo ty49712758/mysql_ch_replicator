@@ -286,7 +286,15 @@ class ClickhouseApi:
             if is_idempotent_ddl_error(e):
                 logger.warning(f'skipping DDL, change already applied: {query} ({e})')
                 return
-            raise
+            # ClickHouse does not name the target table in the error (e.g.
+            # "Cannot add column `c`: column with this name already exists"), so
+            # add the failing query back to make the log actionable.
+            logger.error(f'error executing DDL: {query}: {e}')
+            raise clickhouse_connect.driver.exceptions.DatabaseError(
+                f'{e} [query: {query}]',
+                code=getattr(e, 'code', None),
+                name=getattr(e, 'name', None),
+            ) from e
 
     def recreate_database(self):
         self.drop_database(self.database)
