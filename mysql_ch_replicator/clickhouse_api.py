@@ -26,6 +26,36 @@ def is_optimizable_table_engine(engine: str) -> bool:
     return engine not in NON_OPTIMIZABLE_TABLE_ENGINES
 
 
+# ClickHouse error codes that mean a DDL statement was already applied (or the
+# object it refers to is already gone). Incremental replication replays binlog
+# events at-least-once (the position is only persisted once the event has been
+# fully handled), so a repeat of a DDL that already succeeded must not kill the
+# replicator - it is downgraded to a no-op instead.
+IDEMPOTENT_DDL_ERROR_CODES = frozenset({
+    15,   # DUPLICATE_COLUMN - column with this name already exists
+    16,   # NO_SUCH_COLUMN_IN_TABLE - there is no column with this name
+    47,   # UNKNOWN_IDENTIFIER - identifier is not recognized (e.g. renamed away)
+})
+
+IDEMPOTENT_DDL_ERROR_NAMES = frozenset({
+    'DUPLICATE_COLUMN',
+    'NO_SUCH_COLUMN_IN_TABLE',
+    'UNKNOWN_IDENTIFIER',
+})
+
+
+def is_idempotent_ddl_error(error) -> bool:
+    """True if a ClickHouse error means the DDL was already applied."""
+    if getattr(error, 'code', None) in IDEMPOTENT_DDL_ERROR_CODES:
+        return True
+    if getattr(error, 'name', None) in IDEMPOTENT_DDL_ERROR_NAMES:
+        return True
+    # Older driver versions do not expose code/name - fall back to the symbolic
+    # error name that ClickHouse embeds in the message, e.g. "(DUPLICATE_COLUMN)".
+    message = str(error)
+    return any(name in message for name in IDEMPOTENT_DDL_ERROR_NAMES)
+
+
 def escape_clickhouse_string(value: str) -> str:
     """Quote a value for a ClickHouse string literal."""
     return value.replace('\\', '\\\\').replace("'", "\\'")
@@ -241,6 +271,22 @@ class ClickhouseApi:
                 if attempt == ClickhouseApi.MAX_RETRIES - 1:
                     raise e
                 time.sleep(ClickhouseApi.RETRY_INTERVAL)
+
+    def execute_ddl_command(self, query):
+        """Execute an ALTER/RENAME query that may be replayed by the replicator.
+
+        A replayed DDL whose effect is already in place raises a ClickHouse
+        DatabaseError (e.g. DUPLICATE_COLUMN). That is not a real failure, so it
+        is logged and swallowed instead of crashing the replicator; any other
+        error is re-raised.
+        """
+        try:
+            self.execute_command(query)
+        except clickhouse_connect.driver.exceptions.DatabaseError as e:
+            if is_idempotent_ddl_error(e):
+                logger.warning(f'skipping DDL, change already applied: {query} ({e})')
+                return
+            raise
 
     def recreate_database(self):
         self.drop_database(self.database)

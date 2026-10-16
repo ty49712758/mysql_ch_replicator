@@ -1,10 +1,13 @@
 import pytest
 
+from clickhouse_connect.driver.exceptions import DatabaseError
+
 from mysql_ch_replicator.clickhouse_api import (
     ClickhouseApi,
     ClickhouseSettings,
     comment_clause,
     escape_clickhouse_string,
+    is_idempotent_ddl_error,
 )
 from mysql_ch_replicator.converter import (
     MysqlToClickhouseConverter,
@@ -249,6 +252,10 @@ class FakeClickhouseApi:
     def execute_command(self, query):
         self.queries.append(query)
 
+    # ALTER handlers go through execute_ddl_command; record it like
+    # execute_command so the generated DDL can be asserted.
+    execute_ddl_command = execute_command
+
 
 class FakeState:
     def __init__(self, structures):
@@ -295,7 +302,7 @@ def test_alter_add_column_carries_the_comment():
     )
 
     assert replicator.clickhouse_api.queries == [
-        "ALTER TABLE `db`.`t`  ADD COLUMN `c` String COMMENT '新增列' AFTER id",
+        "ALTER TABLE `db`.`t`  ADD COLUMN IF NOT EXISTS `c` String COMMENT '新增列' AFTER id",
     ]
     assert ch_structure.get_field('c').comment == '新增列'
 
@@ -367,3 +374,115 @@ def test_a_comment_mentioning_not_null_does_not_change_nullability():
     query = replicator.clickhouse_api.queries[0]
     assert 'Nullable(Int32)' in query
     assert "COMMENT 'use not null carefully'" in query
+
+
+# --- replaying a DDL that was already applied must be a no-op ----------------
+
+
+def test_replayed_add_column_uses_if_not_exists_and_keeps_one_field():
+    """
+    A crash can leave ClickHouse with the column while the binlog position is
+    still behind it, so the ADD COLUMN is replayed. It must not fail nor add
+    the field twice to the tracked structure.
+    """
+    replicator, ch_structure = run_alter(
+        "ALTER TABLE `t` ADD COLUMN `c` varchar(20) AFTER id",
+        BASE_MYSQL + [('c', 'varchar(20)')], BASE_CH + [('c', 'String')],
+    )
+
+    assert replicator.clickhouse_api.queries == [
+        "ALTER TABLE `db`.`t`  ADD COLUMN IF NOT EXISTS `c` Nullable(String) AFTER id",
+    ]
+    assert [f.name for f in ch_structure.fields] == ['id', 'c']
+
+
+def test_replayed_add_column_first_keeps_one_field():
+    replicator, ch_structure = run_alter(
+        "ALTER TABLE `t` ADD COLUMN `c` varchar(20) FIRST",
+        BASE_MYSQL + [('c', 'varchar(20)')], BASE_CH + [('c', 'String')],
+    )
+
+    assert 'ADD COLUMN IF NOT EXISTS `c` Nullable(String) FIRST' in replicator.clickhouse_api.queries[0]
+    # The column is already tracked, so it is left where it is rather than moved.
+    assert [f.name for f in ch_structure.fields] == ['id', 'c']
+
+
+def test_mysql_only_table_options_are_ignored():
+    """
+    gh-ost style ALTERs carry MySQL-only options as trailing clauses, e.g.
+    "ALGORITHM=INPLACE, LOCK=SHARED". They must not be treated as an unknown
+    operation.
+    """
+    statement = (
+        "ALTER TABLE `t`\n"
+        "    ADD COLUMN `c` int AFTER id,\n"
+        "    ADD COLUMN `d` int AFTER `c`,\n"
+        "    ALGORITHM=INPLACE, LOCK=SHARED"
+    )
+    replicator, ch_structure = run_alter(statement, BASE_MYSQL, BASE_CH)
+
+    assert replicator.clickhouse_api.queries == [
+        "ALTER TABLE `db`.`t`  ADD COLUMN IF NOT EXISTS `c` Nullable(Int32) AFTER id",
+        "ALTER TABLE `db`.`t`  ADD COLUMN IF NOT EXISTS `d` Nullable(Int32) AFTER c",
+    ]
+    assert [f.name for f in ch_structure.fields] == ['id', 'c', 'd']
+
+
+def test_replayed_drop_column_is_idempotent():
+    """The column may already be gone when the DROP COLUMN is replayed."""
+    replicator, ch_structure = run_alter(
+        "ALTER TABLE `t` DROP COLUMN `c`",
+        BASE_MYSQL, BASE_CH,
+    )
+
+    assert replicator.clickhouse_api.queries == [
+        "ALTER TABLE `db`.`t`  DROP COLUMN IF EXISTS c",
+    ]
+    assert [f.name for f in ch_structure.fields] == ['id']
+
+
+@pytest.mark.parametrize('code,name,message,expected', [
+    (15, None, 'Code: 15. DB::Exception: Cannot add column `c`: column with this name already exists. (DUPLICATE_COLUMN)', True),
+    (16, None, 'Code: 16. DB::Exception: There is no column `c`. (NO_SUCH_COLUMN_IN_TABLE)', True),
+    (47, None, 'Code: 47. DB::Exception: Unknown identifier `c`. (UNKNOWN_IDENTIFIER)', True),
+    (None, 'DUPLICATE_COLUMN', 'DB::Exception: column already exists', True),
+    (None, None, 'Code: 15. DB::Exception: ... (DUPLICATE_COLUMN)', True),
+    (60, None, 'Code: 60. DB::Exception: Table db.t does not exist. (UNKNOWN_TABLE)', False),
+    (None, None, 'Code: 62. Syntax error', False),
+])
+def test_is_idempotent_ddl_error(code, name, message, expected):
+    assert is_idempotent_ddl_error(DatabaseError(message, code=code, name=name)) is expected
+
+
+def _ddl_api(monkeypatch, error):
+    api = object.__new__(ClickhouseApi)
+    api.captured = []
+
+    def execute_command(query):
+        api.captured.append(query)
+        raise error
+
+    api.execute_command = execute_command
+    return api
+
+
+def test_execute_ddl_command_swallows_duplicate_column(monkeypatch):
+    api = _ddl_api(monkeypatch, DatabaseError(
+        'Code: 15. DB::Exception: column with this name already exists. (DUPLICATE_COLUMN)',
+        code=15,
+    ))
+
+    # must not raise
+    api.execute_ddl_command('ALTER TABLE `db`.`t` ADD COLUMN `c` Int32')
+
+    assert api.captured == ['ALTER TABLE `db`.`t` ADD COLUMN `c` Int32']
+
+
+def test_execute_ddl_command_reraises_other_errors(monkeypatch):
+    api = _ddl_api(monkeypatch, DatabaseError(
+        'Code: 60. DB::Exception: Table db.t does not exist. (UNKNOWN_TABLE)',
+        code=60,
+    ))
+
+    with pytest.raises(DatabaseError):
+        api.execute_ddl_command('ALTER TABLE `db`.`t` ADD COLUMN `c` Int32')

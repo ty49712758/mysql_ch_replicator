@@ -1055,6 +1055,12 @@ class MysqlToClickhouseConverter:
             if op_name == 'convert':
                 continue
 
+            # ALTER TABLE may carry MySQL-only table options, e.g.
+            # "ALGORITHM=INPLACE, LOCK=SHARED" as appended by tools like gh-ost.
+            # They have no ClickHouse equivalent and are ignored.
+            if op_name in ('algorithm', 'lock', 'force'):
+                continue
+
             if op_name == 'change':
                 self.__convert_alter_table_change_column(db_name, table_name, tokens, comment)
                 continue
@@ -1162,33 +1168,45 @@ class MysqlToClickhouseConverter:
             mysql_table_structure: TableStructure = table_structure[0]
             ch_table_structure: TableStructure = table_structure[1]
 
-            if column_first:
-                mysql_table_structure.add_field_first(
-                    TableField(name=column_name, field_type=column_type_mysql, comment=comment)
-                )
+            # An ADD COLUMN event can be replayed while the column is already
+            # present (e.g. a crash after ClickHouse applied it but before the
+            # binlog position was persisted). Mirror it only into the structures
+            # that are still missing it, and rely on the IF NOT EXISTS query
+            # below to turn the replay into a no-op.
+            mysql_field_missing = not mysql_table_structure.has_field(column_name)
+            ch_field_missing = not ch_table_structure.has_field(column_name)
 
-                ch_table_structure.add_field_first(
-                    TableField(name=column_name, field_type=column_type_ch, comment=comment)
-                )
+            if column_first:
+                if mysql_field_missing:
+                    mysql_table_structure.add_field_first(
+                        TableField(name=column_name, field_type=column_type_mysql, comment=comment)
+                    )
+
+                if ch_field_missing:
+                    ch_table_structure.add_field_first(
+                        TableField(name=column_name, field_type=column_type_ch, comment=comment)
+                    )
             else:
                 if column_after is None:
                     column_after = strip_sql_name(mysql_table_structure.fields[-1].name)
 
-                mysql_table_structure.add_field_after(
-                    TableField(name=column_name, field_type=column_type_mysql, comment=comment),
-                    column_after,
-                )
+                if mysql_field_missing:
+                    mysql_table_structure.add_field_after(
+                        TableField(name=column_name, field_type=column_type_mysql, comment=comment),
+                        column_after,
+                    )
 
-                ch_table_structure.add_field_after(
-                    TableField(name=column_name, field_type=column_type_ch, comment=comment),
-                    column_after,
-                )
+                if ch_field_missing:
+                    ch_table_structure.add_field_after(
+                        TableField(name=column_name, field_type=column_type_ch, comment=comment),
+                        column_after,
+                    )
 
         target_table_name = self.db_replicator.get_target_table_name(table_name) if self.db_replicator else table_name
         on_cluster = self.db_replicator.clickhouse_api.get_on_cluster_clause() if self.db_replicator else ''
         query = (
             f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} '
-            f'ADD COLUMN `{column_name}` {column_type_ch}{comment_clause(comment)}'
+            f'ADD COLUMN IF NOT EXISTS `{column_name}` {column_type_ch}{comment_clause(comment)}'
         )
         if column_first:
             query += ' FIRST'
@@ -1196,7 +1214,7 @@ class MysqlToClickhouseConverter:
             query += f' AFTER {column_after}'
 
         if self.db_replicator:
-            self.db_replicator.clickhouse_api.execute_command(query)
+            self.db_replicator.clickhouse_api.execute_ddl_command(query)
 
     def __convert_alter_table_drop_column(self, db_name, table_name, tokens):
         if len(tokens) != 1:
@@ -1210,14 +1228,17 @@ class MysqlToClickhouseConverter:
             mysql_table_structure: TableStructure = table_structure[0]
             ch_table_structure: TableStructure = table_structure[1]
 
-            mysql_table_structure.remove_field(field_name=column_name)
-            ch_table_structure.remove_field(field_name=column_name)
+            # A DROP COLUMN event can be replayed after the column is already gone.
+            if mysql_table_structure.has_field(column_name):
+                mysql_table_structure.remove_field(field_name=column_name)
+            if ch_table_structure.has_field(column_name):
+                ch_table_structure.remove_field(field_name=column_name)
 
         target_table_name = self.db_replicator.get_target_table_name(table_name) if self.db_replicator else table_name
         on_cluster = self.db_replicator.clickhouse_api.get_on_cluster_clause() if self.db_replicator else ''
-        query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} DROP COLUMN {column_name}'
+        query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} DROP COLUMN IF EXISTS {column_name}'
         if self.db_replicator:
-            self.db_replicator.clickhouse_api.execute_command(query)
+            self.db_replicator.clickhouse_api.execute_ddl_command(query)
 
     def __convert_alter_table_modify_column(self, db_name, table_name, tokens, comment=''):
         if len(tokens) < 2:
@@ -1269,7 +1290,7 @@ class MysqlToClickhouseConverter:
             f'MODIFY COLUMN `{column_name}` {column_type_ch}{default_clause}{modify_comment_clause(comment)}'
         )
         if self.db_replicator:
-            self.db_replicator.clickhouse_api.execute_command(query)
+            self.db_replicator.clickhouse_api.execute_ddl_command(query)
 
     def __get_default_value_for_type(self, ch_type: str) -> str:
         """Get appropriate default value for ClickHouse type when converting from nullable to non-nullable"""
@@ -1427,7 +1448,7 @@ class MysqlToClickhouseConverter:
                     f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} '
                     f'MODIFY COLUMN {column_name} {column_type_ch}{modify_comment_clause(comment)}'
                 )
-                self.db_replicator.clickhouse_api.execute_command(query)
+                self.db_replicator.clickhouse_api.execute_ddl_command(query)
 
             if column_name != new_column_name:
                 curr_field_mysql = mysql_table_structure.get_field(column_name)
@@ -1437,7 +1458,7 @@ class MysqlToClickhouseConverter:
                 curr_field_clickhouse.name = new_column_name
 
                 query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} RENAME COLUMN {column_name} TO {new_column_name}'
-                self.db_replicator.clickhouse_api.execute_command(query)
+                self.db_replicator.clickhouse_api.execute_ddl_command(query)
 
     def __convert_alter_table_rename_column(self, db_name, table_name, tokens):
         """
@@ -1486,7 +1507,7 @@ class MysqlToClickhouseConverter:
         on_cluster = self.db_replicator.clickhouse_api.get_on_cluster_clause() if self.db_replicator else ''
         query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} RENAME COLUMN `{old_column_name}` TO `{new_column_name}`'
         if self.db_replicator:
-            self.db_replicator.clickhouse_api.execute_command(query)
+            self.db_replicator.clickhouse_api.execute_ddl_command(query)
 
     def _handle_create_table_like(self, create_statement, source_table_name, target_table_name, is_query_api=True):
         """
