@@ -8,6 +8,7 @@ from .binlog_replicator import LogEvent, EventType
 from .table_structure import TableStructure
 from .utils import GracefulKiller, touch_all_files, format_floats
 from .converter import strip_sql_comments
+from .clickhouse_api import TABLE_ALREADY_APPLIED_ERRORS
 from .common import Status
 
 
@@ -233,7 +234,11 @@ class DbReplicatorRealtime:
         if table_name in self.replicator.state.tables_structure:
             self.replicator.state.tables_structure.pop(table_name)
         on_cluster = self.replicator.clickhouse_api.get_on_cluster_clause()
-        self.replicator.clickhouse_api.execute_command(f'DROP TABLE {"IF EXISTS" if if_exists else ""} `{db_name}`.`{target_table_name}` {on_cluster}')
+        # Always IF EXISTS: a replayed DROP TABLE must be a no-op, not a crash.
+        self.replicator.clickhouse_api.execute_ddl_command(
+            f'DROP TABLE IF EXISTS `{db_name}`.`{target_table_name}` {on_cluster}',
+            TABLE_ALREADY_APPLIED_ERRORS,
+        )
 
     def handle_rename_table_query(self, query, db_name):
         tokens = query.split()
@@ -265,7 +270,11 @@ class DbReplicatorRealtime:
 
             ch_clauses.append(f"`{src_db_name}`.`{src_target_table_name}` TO `{dest_db_name}`.`{dest_target_table_name}`")
         on_cluster = self.replicator.clickhouse_api.get_on_cluster_clause()
-        self.replicator.clickhouse_api.execute_command(f'RENAME TABLE {", ".join(ch_clauses)} {on_cluster}')
+        # Replaying a RENAME finds the source table already gone - tolerate it.
+        self.replicator.clickhouse_api.execute_ddl_command(
+            f'RENAME TABLE {", ".join(ch_clauses)} {on_cluster}',
+            TABLE_ALREADY_APPLIED_ERRORS,
+        )
 
     def handle_truncate_query(self, query, db_name):
         """Handle TRUNCATE TABLE operations by clearing data in ClickHouse"""
@@ -301,7 +310,10 @@ class DbReplicatorRealtime:
         # Execute TRUNCATE on ClickHouse
         logger.info(f'Executing TRUNCATE on ClickHouse table: {db_name}.{target_table_name}')
         on_cluster = self.replicator.clickhouse_api.get_on_cluster_clause()
-        self.replicator.clickhouse_api.execute_command(f'TRUNCATE TABLE `{db_name}`.`{target_table_name}` {on_cluster}')
+        self.replicator.clickhouse_api.execute_ddl_command(
+            f'TRUNCATE TABLE `{db_name}`.`{target_table_name}` {on_cluster}',
+            TABLE_ALREADY_APPLIED_ERRORS,
+        )
 
     def log_stats_if_required(self):
         curr_time = time.time()

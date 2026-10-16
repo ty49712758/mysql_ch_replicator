@@ -26,34 +26,38 @@ def is_optimizable_table_engine(engine: str) -> bool:
     return engine not in NON_OPTIMIZABLE_TABLE_ENGINES
 
 
-# ClickHouse error codes that mean a DDL statement was already applied (or the
-# object it refers to is already gone). Incremental replication replays binlog
-# events at-least-once (the position is only persisted once the event has been
-# fully handled), so a repeat of a DDL that already succeeded must not kill the
-# replicator - it is downgraded to a no-op instead.
-IDEMPOTENT_DDL_ERROR_CODES = frozenset({
-    15,   # DUPLICATE_COLUMN - column with this name already exists
-    16,   # NO_SUCH_COLUMN_IN_TABLE - there is no column with this name
-    47,   # UNKNOWN_IDENTIFIER - identifier is not recognized (e.g. renamed away)
+# Incremental replication replays binlog events at-least-once (the position is
+# only persisted once the event has been fully handled), so a repeat of a DDL
+# that already succeeded must not kill the replicator - it is downgraded to a
+# no-op instead.
+#
+# The tolerated errors are grouped by what the statement targets, so a statement
+# only ignores the errors that are harmless for *its own* target: an ALTER on a
+# column must not silently swallow a missing table. Each entry is
+# (symbolic name, ClickHouse error code).
+COLUMN_ALREADY_APPLIED_ERRORS = frozenset({
+    ('DUPLICATE_COLUMN', 15),          # column with this name already exists
+    ('NO_SUCH_COLUMN_IN_TABLE', 16),   # there is no column with this name
+    ('UNKNOWN_IDENTIFIER', 47),        # identifier is not recognized (renamed away)
 })
 
-IDEMPOTENT_DDL_ERROR_NAMES = frozenset({
-    'DUPLICATE_COLUMN',
-    'NO_SUCH_COLUMN_IN_TABLE',
-    'UNKNOWN_IDENTIFIER',
+TABLE_ALREADY_APPLIED_ERRORS = frozenset({
+    ('TABLE_ALREADY_EXISTS', 57),       # table with this name already exists
+    ('UNKNOWN_TABLE', 60),              # table does not exist
 })
 
 
-def is_idempotent_ddl_error(error) -> bool:
-    """True if a ClickHouse error means the DDL was already applied."""
-    if getattr(error, 'code', None) in IDEMPOTENT_DDL_ERROR_CODES:
-        return True
-    if getattr(error, 'name', None) in IDEMPOTENT_DDL_ERROR_NAMES:
-        return True
-    # Older driver versions do not expose code/name - fall back to the symbolic
-    # error name that ClickHouse embeds in the message, e.g. "(DUPLICATE_COLUMN)".
+def is_already_applied_ddl_error(error, tolerated_errors) -> bool:
+    """True if `error` is one of `tolerated_errors` (i.e. the DDL was applied)."""
+    code = getattr(error, 'code', None)
+    name = getattr(error, 'name', None)
+    # Older driver versions expose neither code nor name - fall back to the
+    # symbolic name ClickHouse embeds in the message, e.g. "(DUPLICATE_COLUMN)".
     message = str(error)
-    return any(name in message for name in IDEMPOTENT_DDL_ERROR_NAMES)
+    return any(
+        code == error_code or name == error_name or error_name in message
+        for error_name, error_code in tolerated_errors
+    )
 
 
 def escape_clickhouse_string(value: str) -> str:
@@ -272,18 +276,20 @@ class ClickhouseApi:
                     raise e
                 time.sleep(ClickhouseApi.RETRY_INTERVAL)
 
-    def execute_ddl_command(self, query):
-        """Execute an ALTER/RENAME query that may be replayed by the replicator.
+    def execute_ddl_command(self, query, tolerated_errors=COLUMN_ALREADY_APPLIED_ERRORS):
+        """Execute a DDL query that may be replayed by the replicator.
 
         A replayed DDL whose effect is already in place raises a ClickHouse
         DatabaseError (e.g. DUPLICATE_COLUMN). That is not a real failure, so it
         is logged and swallowed instead of crashing the replicator; any other
-        error is re-raised.
+        error is re-raised. `tolerated_errors` selects which "already applied"
+        errors are harmless for this statement's target - see
+        COLUMN_ALREADY_APPLIED_ERRORS / TABLE_ALREADY_APPLIED_ERRORS.
         """
         try:
             self.execute_command(query)
         except clickhouse_connect.driver.exceptions.DatabaseError as e:
-            if is_idempotent_ddl_error(e):
+            if is_already_applied_ddl_error(e, tolerated_errors):
                 logger.warning(f'skipping DDL, change already applied: {query} ({e})')
                 return
             # ClickHouse does not name the target table in the error (e.g.
@@ -381,12 +387,16 @@ class ClickhouseApi:
         if self.clickhouse_settings.cluster:
             # will fail if shard & replica macros aren't configured in clickhouse-server config
             engine = "ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{database}/{table}/{shard}', '{replica}', _version)"
-            query = self.get_distributed_table_schema(structure.table_name, self.database, structure.if_not_exists) 
+            query = self.get_distributed_table_schema(structure.table_name, self.database, if_not_exists=True)
             queries.append(query)
 
 
+        # Always IF NOT EXISTS: a CREATE TABLE event can be replayed (the binlog
+        # position is only persisted once the event was fully handled), and the
+        # table may already be there. In cluster mode this also repairs a crash
+        # between creating the replicated and the distributed table.
         query = CREATE_TABLE_QUERY.format(**{
-            'if_not_exists': 'IF NOT EXISTS' if structure.if_not_exists else '',
+            'if_not_exists': 'IF NOT EXISTS',
             'db_name': self.database,
             'table_name': structure.table_name,
             'on_cluster': on_cluster,
@@ -401,7 +411,7 @@ class ClickhouseApi:
         queries.insert(0, query) # in case of cluster mode we need to create Replicated Table first before Distributed one
         for query in queries:
             logger.debug(f'create table query: {query}')
-            self.execute_command(query)
+            self.execute_ddl_command(query, TABLE_ALREADY_APPLIED_ERRORS)
 
     def insert(self, table_name, records, table_structure: TableStructure = None):
         current_version = self.get_last_used_version(table_name) + 1

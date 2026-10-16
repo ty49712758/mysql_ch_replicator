@@ -3,11 +3,13 @@ import pytest
 from clickhouse_connect.driver.exceptions import DatabaseError
 
 from mysql_ch_replicator.clickhouse_api import (
+    COLUMN_ALREADY_APPLIED_ERRORS,
+    TABLE_ALREADY_APPLIED_ERRORS,
     ClickhouseApi,
     ClickhouseSettings,
     comment_clause,
     escape_clickhouse_string,
-    is_idempotent_ddl_error,
+    is_already_applied_ddl_error,
 )
 from mysql_ch_replicator.converter import (
     MysqlToClickhouseConverter,
@@ -191,6 +193,16 @@ def test_created_table_carries_comments():
     assert ddl.rstrip().endswith("COMMENT '库存流水表'")
     # the table comment must come after SETTINGS, where ClickHouse expects it
     assert ddl.index('SETTINGS') < ddl.index("COMMENT '库存流水表'")
+
+
+def test_created_table_uses_if_not_exists():
+    """A replayed CREATE TABLE must be a no-op, not a crash."""
+    _, _, clickhouse_structure = parse(STATEMENT)
+    api = make_api()
+
+    api.create_table(clickhouse_structure)
+
+    assert api.captured[0].lstrip().startswith('CREATE TABLE IF NOT EXISTS')
 
 
 def test_no_comment_clause_when_mysql_has_none():
@@ -447,11 +459,26 @@ def test_replayed_drop_column_is_idempotent():
     (47, None, 'Code: 47. DB::Exception: Unknown identifier `c`. (UNKNOWN_IDENTIFIER)', True),
     (None, 'DUPLICATE_COLUMN', 'DB::Exception: column already exists', True),
     (None, None, 'Code: 15. DB::Exception: ... (DUPLICATE_COLUMN)', True),
-    (60, None, 'Code: 60. DB::Exception: Table db.t does not exist. (UNKNOWN_TABLE)', False),
+    # table-level errors are not tolerated by a column-level statement
+    (60, 'UNKNOWN_TABLE', 'Code: 60. DB::Exception: Table db.t does not exist. (UNKNOWN_TABLE)', False),
+    (57, 'TABLE_ALREADY_EXISTS', 'Code: 57. DB::Exception: Table db.t already exists. (TABLE_ALREADY_EXISTS)', False),
     (None, None, 'Code: 62. Syntax error', False),
 ])
-def test_is_idempotent_ddl_error(code, name, message, expected):
-    assert is_idempotent_ddl_error(DatabaseError(message, code=code, name=name)) is expected
+def test_column_statements_tolerate_only_column_errors(code, name, message, expected):
+    error = DatabaseError(message, code=code, name=name)
+
+    assert is_already_applied_ddl_error(error, COLUMN_ALREADY_APPLIED_ERRORS) is expected
+
+
+@pytest.mark.parametrize('code,name,expected', [
+    (57, 'TABLE_ALREADY_EXISTS', True),
+    (60, 'UNKNOWN_TABLE', True),
+    (15, 'DUPLICATE_COLUMN', False),
+])
+def test_table_statements_tolerate_only_table_errors(code, name, expected):
+    error = DatabaseError('boom', code=code, name=name)
+
+    assert is_already_applied_ddl_error(error, TABLE_ALREADY_APPLIED_ERRORS) is expected
 
 
 def _ddl_api(monkeypatch, error):
