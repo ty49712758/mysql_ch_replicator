@@ -89,10 +89,11 @@ class ReportSlave(object):
             self.hostname = value
 
     def __repr__(self):
-        return "<ReportSlave hostname=%s username=%s password=%s port=%d>" % (
+        # The password is deliberately omitted so it cannot leak through logs
+        # or exception messages that render this object.
+        return "<ReportSlave hostname=%s username=%s port=%d>" % (
             self.hostname,
             self.username,
-            self.password,
             self.port,
         )
 
@@ -770,6 +771,27 @@ class BinLogStreamReader(object):
         self.dbms = "mysql"
         return "mysql"
 
+    # Substrings marking a parameter whose value is a secret. Matching keys are
+    # masked so passwords never end up in the log file.
+    SENSITIVE_PARAMETER_MARKERS = ("password", "passwd")
+
+    @classmethod
+    def _is_sensitive_parameter(cls, parameter):
+        parameter = str(parameter).lower()
+        return any(marker in parameter for marker in cls.SENSITIVE_PARAMETER_MARKERS)
+
+    @classmethod
+    def _redact_sensitive_values(cls, parameter, value):
+        """Return `value` with password-like fields replaced by '***'."""
+        if cls._is_sensitive_parameter(parameter):
+            return "***"
+        if isinstance(value, dict):
+            return {
+                key: cls._redact_sensitive_values(key, item)
+                for key, item in value.items()
+            }
+        return value
+
     def __log_valid_parameters(self):
         ignored = ["allowed_events", "table_map"]
         for parameter, value in self.__dict__.items():
@@ -784,7 +806,7 @@ class BinLogStreamReader(object):
                 items = ", ".join(string_list)
                 comment = f"{parameter}: [{items}]"
             else:
-                comment = f"{parameter}: {value}"
+                comment = f"{parameter}: {self._redact_sensitive_values(parameter, value)}"
             logging.info(comment)
 
     def __iter__(self):

@@ -2,6 +2,7 @@ import pytest
 
 from mysql_ch_replicator.binlog_replicator import BinlogReplicator
 from mysql_ch_replicator.config import BinlogReplicatorSettings, Settings
+from mysql_ch_replicator.pymysqlreplication.binlogstream import ReportSlave
 
 
 def test_connection_tuning_defaults_to_unset():
@@ -87,3 +88,24 @@ def test_configured_values_are_forwarded_to_the_stream(tmp_path):
 
     assert connection_settings_of(replicator)['connect_timeout'] == 30
     assert replicator.stream.slave_heartbeat == 20
+
+
+def test_password_is_not_written_to_the_log(tmp_path, caplog):
+    """BinLogStreamReader logs its parameters on startup - never the password."""
+    settings = Settings()
+    settings.load(write_config(tmp_path, {}))
+    settings.binlog_replicator.validate()
+    settings.mysql.password = 'sup3r-s3cret'
+
+    with caplog.at_level('INFO'):
+        BinlogReplicator(settings)
+
+    assert 'sup3r-s3cret' not in caplog.text
+    # the parameters are still logged, with the secret masked out
+    assert "'passwd': '***'" in caplog.text
+
+
+def test_report_slave_repr_hides_the_password():
+    slave = ReportSlave(('host', 'user', 's3cret', 3306))
+
+    assert 's3cret' not in repr(slave)
