@@ -1,0 +1,26 @@
+# 本地 Windows 虚拟环境(含 lib64 符号链接,正是本次报错元凶;且绝不能进 Linux 镜像)
+.venv/
+venv/
+env/
+
+# 版本控制 / IDE / 缓存
+.git/
+.github/
+.idea/
+.vscode/
+.pytest_cache/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# 构建产物与本地运行数据
+dist/
+build/
+*.egg-info/
+binlog/
+*cmake_build*
+monitoring.log
+.DS_Store
+
+# 本地配置(含密码,不随镜像分发;运行时通过 -v 挂载)
+config.yaml
