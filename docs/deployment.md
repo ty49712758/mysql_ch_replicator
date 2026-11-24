@@ -576,3 +576,69 @@ ERROR] operational error (2003, "Can't connect to MySQL server on '10.x.x.x' (ti
 `ReplacingMergeTree(_version)`,即使个别事件重复投递也会被 `FINAL` 去重。唯一需要警惕的是
 **中断时间超过 MySQL 的 `binlog_expire_logs_seconds`** —— 服务器上的 binlog 被清理后续读会失败,
 届时要重做初始复制。
+
+### 9.9 跳过异常表并补齐数据
+
+某张表出现无法解析或写入的异常事件，导致 `db_replicator` 反复报错、卡住时，可以先把这张表临时
+从复制中排除，等复制进程越过异常事件后恢复，再补齐排除期间缺失的数据。
+
+**第 1 步：临时排除问题表。** 在配置文件顶层加入 `exclude_tables`（支持 `fnmatch` 通配符）：
+
+```yaml
+exclude_tables: ['test_table_15', 'test_table_*42']
+```
+
+配置在进程启动时加载，改动后必须重启进程才会生效。`exclude_tables` 在两个环节同时过滤：
+
+- `binlog_replicator` 落盘前跳过该表事件 —— **排除期间该表的 binlog 不会写入本地缓存**；
+- `db_replicator` 消费时再次跳过该表事件（双保险）。
+
+父进程 `runner` 会监控并自动拉起死掉的子进程，因此直接 `kill` 子进程后会被自动重启并加载新配置；
+最稳妥的是重启整个服务（两个子进程都重新加载配置）：
+
+```bash
+sudo systemctl restart mysql-ch-replicator
+```
+
+> 过滤需要 `binlog_replicator` 与 `db_replicator` **两个子进程**同时用上新配置，只 kill 其中一个
+> 排除不会完整生效：只重启 `db_replicator` 时该表事件仍会被 `binlog_replicator` 落盘；只重启
+> `binlog_replicator` 时已落盘的事件仍会被 `db_replicator` 消费。
+
+**第 2 步：越过异常事件后恢复配置。** 确认复制进程已越过之前出错的位置（日志中 `processed events`
+持续增长、无新报错），把 `exclude_tables` 去掉（或只去掉对应表），再重启一次服务恢复该表的复制。
+
+> 排除期间该表事件没有落盘，这段时间的增量数据已经丢失，因此恢复后必须做一次全量补齐（第 3 步）。
+
+**第 3 步：补齐缺失的数据。** 两种方式按场景选用。
+
+方式 A —— 手动全量（表已有数据、只补缺口时推荐）：
+
+```sql
+INSERT INTO ch_db.bad_table (col1, col2, ..., _version)
+SELECT col1, col2, ..., (SELECT COALESCE(MAX(_version), 0) + 1 FROM ch_db.bad_table)
+FROM mysql('mysql_host:3306', 'src_db', 'bad_table', 'user', 'pwd');
+```
+
+> 关键：`_version` 必须**大于表内当前最大 `_version`**，不能写 `0`。目标表是
+> `ReplacingMergeTree(_version)`，同主键保留 `_version` 最大的一行；若补全数据 version 过小，
+> 会被旧数据淘汰、补全失效。用 `MAX(_version) + 1` 可保证补全数据胜出。
+
+方式 B —— 工具单表初始复制（表数据可整体重建时）：
+
+```bash
+.venv/bin/mysql_ch_replicator db_replicator \
+  --config /mnt/d/cdc/mysql2ck.yaml \
+  --db test_ck_sync \
+  --table menu2 \
+  --worker_id 0 --total_workers 1 \
+  --target_db test_ck_sync \
+  --initial_only=True
+```
+
+> 参数不能省：
+> - `--worker_id 0 --total_workers 1` **同时给出**才进入 worker 模式、直接写入目标库；若省略，会走
+>   数据库交换流程（`RENAME DATABASE`，把目标库替换成只含该单表的临时库），**导致目标库其它表被删除**。
+> - `--table menu2` 限定只处理这一张表；`--initial_only=True` 只做初始全量、完成即退出。
+>
+> 方式 B 假设目标表结构已存在（worker 模式不建表），且 `_version` 从 1 重新开始；若该表已有
+> version ≥ 1 的旧数据，新数据会被旧数据淘汰。因此它适合「表可整体重建」的场景，需保留已有数据时用方式 A。
