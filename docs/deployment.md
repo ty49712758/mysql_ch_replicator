@@ -82,8 +82,8 @@ poetry build
 给 fork 打 tag 固定版本,保证部署可复现:
 
 ```bash
-git tag -a v0.1.18-fix -m "timezone + partition nullable fixes"
-git push origin v0.1.18-fix
+git tag -a v1.0.0 -m "timezone + partition nullable fixes"
+git push origin v1.0.0
 ```
 
 ---
@@ -109,7 +109,7 @@ sudo -u replicator bash -lc '
   cd /opt/mysql-ch-replicator
   python3 -m venv .venv
   .venv/bin/pip install --upgrade pip
-  .venv/bin/pip install /tmp/mysql_ch_replicator-0.1.18-py3-none-any.whl
+  .venv/bin/pip install /tmp/mysql_ch_replicator-1.0.0-py3-none-any.whl
 '
 ```
 
@@ -118,7 +118,7 @@ sudo -u replicator bash -lc '
 也可以用 `pipx` 简化:
 
 ```bash
-pipx install /tmp/mysql_ch_replicator-0.1.18-py3-none-any.whl
+pipx install /tmp/mysql_ch_replicator-1.0.0-py3-none-any.whl
 # 命令会出现在 ~/.local/bin/mysql_ch_replicator
 ```
 
@@ -393,13 +393,13 @@ SELECT name, value, changed FROM system.settings WHERE name = 'final';
 > ⚠️ **不要直接使用上游镜像 `fippo/mysql-ch-replicator:latest`。** 它是上游版本,不包含本 fork 的修复。
 
 ```bash
-docker build -t mysql-ch-replicator:0.1.18-fix .
+docker build -t mysql-ch-replicator:1.0.0 .
 
 docker run -d --restart=always --name mysql-ch-replicator \
   -e TZ=Asia/Shanghai \
   -v /etc/mysql-ch-replicator/config.yaml:/app/config.yaml:ro \
   -v /var/lib/mysql-ch-replicator/data:/app/data \
-  mysql-ch-replicator:0.1.18-fix \
+  mysql-ch-replicator:1.0.0 \
   --config /app/config.yaml run_all
 ```
 
@@ -408,7 +408,7 @@ docker run -d --restart=always --name mysql-ch-replicator \
 ```yaml
 services:
   mysql-ch-replicator:
-    image: mysql-ch-replicator:0.1.18-fix
+    image: mysql-ch-replicator:1.0.0
     restart: always
     environment:
       - TZ=Asia/Shanghai
@@ -432,13 +432,13 @@ Docker 的优点是把 Python 环境一并固化;缺点是排查问题时需进�
 
 ```bash
 # ── 开发机 ──────────────────────────────
-git tag v0.1.19 && git push --tags
+git tag v1.0.0 && git push --tags
 python -m build
-scp dist/mysql_ch_replicator-0.1.19-py3-none-any.whl server:/tmp/
+scp dist/mysql_ch_replicator-1.0.0-py3-none-any.whl server:/tmp/
 
 # ── 服务器 ──────────────────────────────
 sudo -u replicator /opt/mysql-ch-replicator/.venv/bin/pip install \
-    --force-reinstall /tmp/mysql_ch_replicator-0.1.19-py3-none-any.whl
+    --force-reinstall /tmp/mysql_ch_replicator-1.0.0-py3-none-any.whl
 sudo systemctl restart mysql-ch-replicator
 sudo systemctl status mysql-ch-replicator
 ```
