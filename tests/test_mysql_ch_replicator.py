@@ -420,6 +420,21 @@ def test_parse_mysql_table_structure():
     assert structure.table_name == 'user_preferences_portal'
 
 
+def test_parse_mysql_table_structure_charset_before_row_format():
+    query = (
+        "CREATE TABLE `t` (\n"
+        "  `id` int NOT NULL\n"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8 ROW_FORMAT=DYNAMIC"
+    )
+
+    converter = MysqlToClickhouseConverter()
+
+    structure = converter.parse_mysql_table_structure(query)
+
+    assert structure.charset == 'utf8'
+    assert structure.charset_python == 'utf_8'
+
+
 def test_alter_tokens_split():
     examples = [
         # basic examples from the prompt:

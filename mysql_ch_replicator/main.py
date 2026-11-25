@@ -52,8 +52,7 @@ def set_logging_config(tags, log_file=None, log_level_str=None):
 
 
 def run_binlog_replicator(args, config: Settings):
-    if not os.path.exists(config.binlog_replicator.data_dir):
-        os.mkdir(config.binlog_replicator.data_dir)
+    os.makedirs(config.binlog_replicator.data_dir, exist_ok=True)
 
     log_file = os.path.join(
         config.binlog_replicator.data_dir,
@@ -73,16 +72,14 @@ def run_db_replicator(args, config: Settings):
 
     db_name = args.db
 
-    if not os.path.exists(config.binlog_replicator.data_dir):
-        os.mkdir(config.binlog_replicator.data_dir)
+    os.makedirs(config.binlog_replicator.data_dir, exist_ok=True)
 
     db_dir = os.path.join(
         config.binlog_replicator.data_dir,
         db_name,
     )
 
-    if not os.path.exists(db_dir):
-        os.mkdir(db_dir)
+    os.makedirs(db_dir, exist_ok=True)
 
     log_file = os.path.join(
         db_dir,
@@ -119,8 +116,7 @@ def run_db_replicator(args, config: Settings):
 
 def run_db_optimizer(args, config: Settings):
     data_dir = config.binlog_replicator.data_dir
-    if not os.path.exists(data_dir):
-        os.mkdir(data_dir)
+    os.makedirs(data_dir, exist_ok=True)
 
     log_file = os.path.join(
         data_dir,

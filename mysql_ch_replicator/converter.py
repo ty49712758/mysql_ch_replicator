@@ -1800,7 +1800,9 @@ class MysqlToClickhouseConverter:
         for line in tokens[4:]:
             curr_token = line.value
             if prev_token == '=' and prev_prev_token.lower() == 'charset':
-                structure.charset = curr_token
+                # sqlparse may merge an unrecognized following option into the
+                # value token (e.g. "utf8 ROW_FORMAT"), so keep only the charset.
+                structure.charset = curr_token.split()[0].lower()
             prev_prev_token = prev_token
             prev_token = curr_token
 

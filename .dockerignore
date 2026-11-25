@@ -17,6 +17,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+*.tar
 binlog/
 *cmake_build*
 monitoring.log
