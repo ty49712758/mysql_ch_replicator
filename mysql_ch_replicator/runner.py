@@ -12,6 +12,7 @@ from .config import Settings
 from .mysql_api import MySQLApi
 from .monitoring import bnum
 from .utils import ProcessRunner, GracefulKiller
+from .binlog_replicator import DataReader
 
 from . import db_replicator
 
@@ -90,10 +91,11 @@ class Runner:
     def health(self):
         mysql_info = self._get_mysql_binlog_info()
         processes = self._get_processes_status()
+        databases_status = self._get_databases_status(mysql_info)
         return {
             'status': self._get_overall_status(processes),
-            'binlog': self._get_binlog_status(mysql_info),
-            'databases': self._get_databases_status(mysql_info),
+            'binlog': self._get_binlog_status(mysql_info, databases_status),
+            'databases': databases_status,
             'processes': processes,
         }
 
@@ -125,17 +127,13 @@ class Runner:
                 total += size
         return total + pos
 
-    def _compute_lag_bytes(self, transaction, mysql_info):
-        if transaction is None or mysql_info is None:
-            return None
-        master = mysql_info.get('master')
-        files_sizes = mysql_info.get('files_sizes')
-        if not master or not files_sizes:
+    def _compute_lag_bytes(self, transaction, latest_transaction, files_sizes):
+        if transaction is None or latest_transaction is None or not files_sizes:
             return None
         try:
-            mysql_offset = self._absolute_binlog_offset(master[0], master[1], files_sizes)
+            latest_offset = self._absolute_binlog_offset(latest_transaction[0], latest_transaction[1], files_sizes)
             tx_offset = self._absolute_binlog_offset(transaction[0], transaction[1], files_sizes)
-            return mysql_offset - tx_offset
+            return latest_offset - tx_offset
         except Exception:
             logger.warning('failed to compute byte-level lag for health', exc_info=True)
             return None
@@ -147,7 +145,7 @@ class Runner:
         with open(file_path, 'rt') as f:
             return json.load(f)
 
-    def _get_binlog_status(self, mysql_info):
+    def _get_binlog_status(self, mysql_info, databases_status):
         last_seen_transaction = None
         try:
             state = self._get_binlog_state()
@@ -156,10 +154,17 @@ class Runner:
         except Exception:
             logger.warning('failed to read binlog state for health', exc_info=True)
 
+        lag_values = [
+            status.get('lag_bytes')
+            for status in databases_status.values()
+            if status.get('lag_bytes') is not None
+        ]
+        lag_bytes = max(lag_values) if lag_values else None
+
         return {
             'mysql_latest': mysql_info.get('latest_file') if mysql_info else None,
-            'replicator_position': last_seen_transaction[0] if last_seen_transaction else None,
-            'lag_bytes': self._compute_lag_bytes(last_seen_transaction, mysql_info),
+            'replicator_position': list(last_seen_transaction) if last_seen_transaction else None,
+            'lag_bytes': lag_bytes,
         }
 
     def _get_databases_status(self, mysql_info):
@@ -186,13 +191,23 @@ class Runner:
             }
 
         last_processed = state.last_processed_transaction
+        last_available = self._get_last_available_transaction(db_name)
+        files_sizes = mysql_info.get('files_sizes') if mysql_info else None
 
         return {
             'status': state.status.name if state.status else None,
             'status_code': state.status.value if state.status else None,
             'last_processed_transaction': list(last_processed) if last_processed else None,
-            'lag_bytes': self._compute_lag_bytes(last_processed, mysql_info),
+            'lag_bytes': self._compute_lag_bytes(last_processed, last_available, files_sizes),
         }
+
+    def _get_last_available_transaction(self, db_name):
+        try:
+            reader = DataReader(self.config.binlog_replicator, db_name)
+            return reader.get_last_transaction_id()
+        except Exception:
+            logger.warning(f'failed to read last available transaction for {db_name} for health', exc_info=True)
+            return None
 
     def _get_processes_status(self):
         db_processes = {
