@@ -35,10 +35,19 @@ class ProcessRunner:
     def __init__(self, cmd):
         self.cmd = cmd
         self.process = None
+        self.last_exit_code = None
 
     def run(self):
         cmd = self.cmd.split()
         self.process = subprocess.Popen(cmd)
+
+    def poll(self):
+        if self.process is None:
+            return None
+        exit_code = self.process.poll()
+        if exit_code is not None:
+            self.last_exit_code = exit_code
+        return exit_code
 
     def restart_dead_process_if_required(self):
         if self.process is None:
@@ -46,7 +55,7 @@ class ProcessRunner:
             self.run()
             return
 
-        res = self.process.poll()
+        res = self.poll()
         if res is None:
             # Process is running fine.
             return

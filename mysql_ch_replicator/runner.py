@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import sys
 import threading
@@ -9,6 +10,7 @@ from logging import getLogger
 
 from .config import Settings
 from .mysql_api import MySQLApi
+from .monitoring import bnum
 from .utils import ProcessRunner, GracefulKiller
 
 from . import db_replicator
@@ -64,13 +66,12 @@ class Runner:
         self.config = config
         self.databases = databases or config.databases
         self.wait_initial_replication = wait_initial_replication
-        self.runners: dict[str: DbReplicatorRunner] = {}
+        self.runners: dict[str, DbReplicatorRunner] = {}
         self.binlog_runner = None
         self.db_optimizer = None
         self.http_server = None
         self.router = None
-        self.need_restart_replication = False
-        self.replication_restarted = False
+        self.mysql_api = None
 
     def run_server(self):
         if not self.config.http_host or not self.config.http_port:
@@ -80,19 +81,148 @@ class Runner:
 
         config = Config(app=app, host=self.config.http_host, port=self.config.http_port)
         self.router = APIRouter()
-        self.router.add_api_route("/restart_replication", self.restart_replication, methods=["GET"])
+        self.router.add_api_route("/health", self.health, methods=["GET"])
         app.include_router(self.router)
 
         self.http_server = Server(config)
         self.http_server.run()
 
-    def restart_replication(self):
-        self.replication_restarted = False
-        self.need_restart_replication = True
-        while not self.replication_restarted:
-            logger.info('waiting replication restarted..')
-            time.sleep(1)
-        return {"restarted": True}
+    def health(self):
+        mysql_info = self._get_mysql_binlog_info()
+        processes = self._get_processes_status()
+        return {
+            'status': self._get_overall_status(processes),
+            'binlog': self._get_binlog_status(mysql_info),
+            'databases': self._get_databases_status(mysql_info),
+            'processes': processes,
+        }
+
+    def _get_mysql_binlog_info(self):
+        try:
+            if self.mysql_api is None:
+                return None
+            files_sizes = self.mysql_api.get_binlog_files_with_sizes()
+            master = self.mysql_api.get_master_status()
+            latest_file = None
+            if master:
+                latest_file = master[0]
+            elif files_sizes:
+                latest_file = sorted(files_sizes, key=lambda item: bnum(item[0]))[-1][0]
+            return {
+                'master': master,
+                'files_sizes': files_sizes,
+                'latest_file': latest_file,
+            }
+        except Exception:
+            logger.warning('failed to read mysql binlog info for health', exc_info=True)
+            return None
+
+    def _absolute_binlog_offset(self, file_name, pos, files_sizes):
+        target_num = bnum(file_name)
+        total = 0
+        for name, size in files_sizes:
+            if bnum(name) < target_num:
+                total += size
+        return total + pos
+
+    def _compute_lag_bytes(self, transaction, mysql_info):
+        if transaction is None or mysql_info is None:
+            return None
+        master = mysql_info.get('master')
+        files_sizes = mysql_info.get('files_sizes')
+        if not master or not files_sizes:
+            return None
+        try:
+            mysql_offset = self._absolute_binlog_offset(master[0], master[1], files_sizes)
+            tx_offset = self._absolute_binlog_offset(transaction[0], transaction[1], files_sizes)
+            return mysql_offset - tx_offset
+        except Exception:
+            logger.warning('failed to compute byte-level lag for health', exc_info=True)
+            return None
+
+    def _get_binlog_state(self):
+        file_path = os.path.join(self.config.binlog_replicator.data_dir, 'state.json')
+        if not os.path.exists(file_path):
+            return None
+        with open(file_path, 'rt') as f:
+            return json.load(f)
+
+    def _get_binlog_status(self, mysql_info):
+        last_seen_transaction = None
+        try:
+            state = self._get_binlog_state()
+            if state and state.get('last_seen_transaction') is not None:
+                last_seen_transaction = state['last_seen_transaction']
+        except Exception:
+            logger.warning('failed to read binlog state for health', exc_info=True)
+
+        return {
+            'mysql_latest': mysql_info.get('latest_file') if mysql_info else None,
+            'replicator_position': last_seen_transaction[0] if last_seen_transaction else None,
+            'lag_bytes': self._compute_lag_bytes(last_seen_transaction, mysql_info),
+        }
+
+    def _get_databases_status(self, mysql_info):
+        return {
+            db_name: self._get_database_status(db_name, mysql_info)
+            for db_name in list(self.runners.keys())
+        }
+
+    def _get_database_status(self, db_name, mysql_info):
+        state_path = os.path.join(
+            self.config.binlog_replicator.data_dir,
+            db_name,
+            'state.pckl',
+        )
+        try:
+            state = db_replicator.State(state_path)
+        except Exception:
+            logger.warning(f'failed to read state for {db_name} for health', exc_info=True)
+            return {
+                'status': None,
+                'status_code': None,
+                'last_processed_transaction': None,
+                'lag_bytes': None,
+            }
+
+        last_processed = state.last_processed_transaction
+
+        return {
+            'status': state.status.name if state.status else None,
+            'status_code': state.status.value if state.status else None,
+            'last_processed_transaction': list(last_processed) if last_processed else None,
+            'lag_bytes': self._compute_lag_bytes(last_processed, mysql_info),
+        }
+
+    def _get_processes_status(self):
+        db_processes = {
+            db_name: self._get_process_status(runner)
+            for db_name, runner in list(self.runners.items())
+        }
+        return {
+            'binlog_replicator': self._get_process_status(self.binlog_runner),
+            'db_optimizer': self._get_process_status(self.db_optimizer),
+            'db_replicators': db_processes,
+        }
+
+    def _get_process_status(self, runner):
+        if runner is None or runner.process is None:
+            return {'state': 'not_started', 'alive': False, 'last_exit_code': None}
+        if runner.poll() is None:
+            return {'state': 'running', 'alive': True, 'last_exit_code': runner.last_exit_code}
+        return {'state': 'exited', 'alive': False, 'last_exit_code': runner.last_exit_code}
+
+    def _get_overall_status(self, processes):
+        states = [
+            processes['binlog_replicator']['state'],
+            processes['db_optimizer']['state'],
+        ]
+        states.extend(p['state'] for p in processes['db_replicators'].values())
+        if 'exited' in states:
+            return 'degraded'
+        if 'not_started' in states:
+            return 'starting'
+        return 'ok'
 
     def is_initial_replication_finished(self, db_name):
         state_path = os.path.join(
@@ -110,23 +240,6 @@ class Runner:
             self.binlog_runner.restart_dead_process_if_required()
         if self.db_optimizer is not None:
             self.db_optimizer.restart_dead_process_if_required()
-
-    def restart_replication_if_required(self):
-        if not self.need_restart_replication:
-            return
-        logger.info('restarting replication')
-        for db_name, runner in self.runners.items():
-            logger.info(f'stopping runner {db_name}')
-            runner.stop()
-            path = os.path.join(self.config.binlog_replicator.data_dir, db_name, 'state.pckl')
-            if os.path.exists(path):
-                logger.debug(f'removing {path}')
-                os.remove(path)
-
-        logger.info('starting replication')
-        self.restart_dead_processes()
-        self.need_restart_replication = False
-        self.replication_restarted = True
 
     def check_databases_updated(self, mysql_api: MySQLApi):
         logger.debug('check if databases were created / removed in mysql')
@@ -149,12 +262,12 @@ class Runner:
             self.runners.pop(db)
 
     def run(self):
-        mysql_api = MySQLApi(
+        self.mysql_api = MySQLApi(
             database=None,
             mysql_settings=self.config.mysql,
             mysql_timezone=self.config.mysql_timezone,
         )
-        databases = mysql_api.get_databases()
+        databases = self.mysql_api.get_databases()
         databases = [db for db in databases if self.config.is_database_matches(db)]
 
         killer = GracefulKiller()
@@ -204,10 +317,9 @@ class Runner:
         last_check_db_updated = time.time()
         while not killer.kill_now:
             time.sleep(1)
-            self.restart_replication_if_required()
             self.restart_dead_processes()
             if time.time() - last_check_db_updated > self.config.check_db_updated_interval:
-                self.check_databases_updated(mysql_api=mysql_api)
+                self.check_databases_updated(mysql_api=self.mysql_api)
                 last_check_db_updated = time.time()
 
         logger.info('stopping runner')

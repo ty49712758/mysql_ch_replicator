@@ -312,9 +312,9 @@ sudo systemctl status mysql-ch-replicator
 sudo journalctl -u mysql-ch-replicator -f
 ```
 
-### 内置 HTTP 控制接口(可选)
+### 内置 HTTP 接口(可选)
 
-配置 `http_host` / `http_port` 后可远程触发操作,例如重启复制:
+配置 `http_host` / `http_port` 后可通过 HTTP 查询复制状态:
 
 ```yaml
 http_host: '127.0.0.1'
@@ -322,10 +322,10 @@ http_port: 9128
 ```
 
 ```bash
-curl http://127.0.0.1:9128/restart_replication
+curl http://127.0.0.1:9128/health
 ```
 
-接口文档在 `/docs`。生产环境建议绑定 `127.0.0.1` 或置于防火墙/反向代理之后。
+`/health` 为只读接口,返回各库复制状态、binlog 位点差以及各子进程运行状态。接口文档在 `/docs`。生产环境建议绑定 `127.0.0.1` 或置于防火墙/反向代理之后。
 
 ---
 
@@ -363,19 +363,22 @@ GRANT SELECT, SUPER, REPLICATION SLAVE ON *.* TO 'user'@'%' IDENTIFIED BY 'passw
     <profiles>
         <default>
             <final>1</final>
-            <max_query_size>300000000</max_query_size>
-            <max_ast_elements>1000000</max_ast_elements>
-            <max_expanded_ast_elements>1000000</max_expanded_ast_elements>
         </default>
     </profiles>
 </clickhouse>
 ```
 
+直接在 ClickHouse 客户端里执行：
+```sql
+-- 重新读取 config.xml、users.xml 以及它们对应目录下的所有配置文件，并且是同步执行的
+SYSTEM RELOAD CONFIG;
+```
+
 确认生效:
 
 ```sql
-SELECT name, value, changed FROM system.settings WHERE name = 'final';
 -- value 应为 1
+SELECT name, value, changed FROM system.settings WHERE name = 'final';
 ```
 
 ### 其它

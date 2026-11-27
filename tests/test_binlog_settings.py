@@ -109,3 +109,16 @@ def test_report_slave_repr_hides_the_password():
     slave = ReportSlave(('host', 'user', 's3cret', 3306))
 
     assert 's3cret' not in repr(slave)
+
+
+def test_update_state_does_not_wipe_saved_position_with_none(tmp_path):
+    """A None transaction (idle, caught-up stream) must not overwrite a saved position."""
+    replicator = make_replicator(tmp_path)
+    transaction = ('mysql-bin.002290', 479449447)
+    replicator.state.last_seen_transaction = transaction
+    replicator.state.prev_last_seen_transaction = transaction
+
+    replicator.update_state_if_required(None, force=True)
+
+    assert replicator.state.last_seen_transaction == transaction
+    assert replicator.state.prev_last_seen_transaction == transaction

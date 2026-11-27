@@ -337,17 +337,6 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
     assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 5)
     assert_wait(lambda: ch.select(TEST_TABLE_NAME, "age=1912")[0]['name'] == 'Hällo')
 
-    ch.drop_database(TEST_DB_NAME)
-    ch.drop_database(TEST_DB_NAME_2)
-
-    requests.get('http://localhost:9128/restart_replication')
-    time.sleep(1.0)
-
-    assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
-
-    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 5)
-    assert_wait(lambda: ch.select(TEST_TABLE_NAME, "age=1912")[0]['name'] == 'Hällo')
-
     mysql.create_database(TEST_DB_NAME_2)
     assert_wait(lambda: TEST_DB_NAME_2_DESTINATION in ch.get_databases())
 
@@ -522,4 +511,3 @@ def test_create_table_like():
     # Clean up
     db_replicator_runner.stop()
     binlog_replicator_runner.stop()
-

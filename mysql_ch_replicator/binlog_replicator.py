@@ -549,6 +549,8 @@ class BinlogReplicator:
         logger.info('stopped')
 
     def update_state_if_required(self, transaction_id, force: bool = False):
+        if transaction_id is None:
+            return
         curr_time = time.time()
         if curr_time - self.last_state_update < BinlogReplicator.SAVE_UPDATE_INTERVAL and not force:
             return

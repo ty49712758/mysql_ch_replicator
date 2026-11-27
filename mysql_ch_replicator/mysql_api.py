@@ -150,6 +150,20 @@ class MySQLApi:
         tables = [x[0] for x in res]
         return tables
 
+    def get_binlog_files_with_sizes(self):
+        self.reconnect_if_required()
+        self.cursor.execute('SHOW BINARY LOGS')
+        res = self.cursor.fetchall()
+        return [(x[0], int(x[1])) for x in res]
+
+    def get_master_status(self):
+        self.reconnect_if_required()
+        self.cursor.execute('SHOW MASTER STATUS')
+        res = self.cursor.fetchall()
+        if not res:
+            return None
+        return (res[0][0], int(res[0][1]))
+
     def get_table_create_statement(self, table_name) -> str:
         self.reconnect_if_required()
         self.cursor.execute(f'SHOW CREATE TABLE `{table_name}`')
