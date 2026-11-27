@@ -88,9 +88,9 @@ class Runner:
         self.http_server = Server(config)
         self.http_server.run()
 
-    def health(self):
+    def health(self, binlog_replicator_lines: int = 3, db_optimizer_lines: int = 3, db_replicators_lines: int = 3):
         mysql_info = self._get_mysql_binlog_info()
-        processes = self._get_processes_status()
+        processes = self._get_processes_status(binlog_replicator_lines, db_optimizer_lines, db_replicators_lines)
         databases_status = self._get_databases_status(mysql_info)
         return {
             'status': self._get_overall_status(processes),
@@ -209,23 +209,63 @@ class Runner:
             logger.warning(f'failed to read last available transaction for {db_name} for health', exc_info=True)
             return None
 
-    def _get_processes_status(self):
+    def _get_processes_status(self, binlog_replicator_lines, db_optimizer_lines, db_replicators_lines):
+        data_dir = self.config.binlog_replicator.data_dir
         db_processes = {
-            db_name: self._get_process_status(runner)
+            db_name: self._get_process_status(
+                runner,
+                os.path.join(data_dir, db_name, 'db_replicator.log'),
+                db_replicators_lines,
+            )
             for db_name, runner in list(self.runners.items())
         }
         return {
-            'binlog_replicator': self._get_process_status(self.binlog_runner),
-            'db_optimizer': self._get_process_status(self.db_optimizer),
+            'binlog_replicator': self._get_process_status(
+                self.binlog_runner,
+                os.path.join(data_dir, 'binlog_replicator.log'),
+                binlog_replicator_lines,
+            ),
+            'db_optimizer': self._get_process_status(
+                self.db_optimizer,
+                os.path.join(data_dir, 'db_optimizer.log'),
+                db_optimizer_lines,
+            ),
             'db_replicators': db_processes,
         }
 
-    def _get_process_status(self, runner):
+    def _get_process_status(self, runner, log_file, lines):
         if runner is None or runner.process is None:
-            return {'state': 'not_started', 'alive': False, 'last_exit_code': None}
-        if runner.poll() is None:
-            return {'state': 'running', 'alive': True, 'last_exit_code': runner.last_exit_code}
-        return {'state': 'exited', 'alive': False, 'last_exit_code': runner.last_exit_code}
+            status = {'state': 'not_started', 'alive': False, 'last_exit_code': None}
+        elif runner.poll() is None:
+            status = {'state': 'running', 'alive': True, 'last_exit_code': runner.last_exit_code}
+        else:
+            status = {'state': 'exited', 'alive': False, 'last_exit_code': runner.last_exit_code}
+        status['logs'] = self._read_last_lines(log_file, lines)
+        return status
+
+    def _read_last_lines(self, file_path, n):
+        n = max(0, min(n, 100))
+        if n == 0:
+            return []
+        try:
+            with open(file_path, 'rb') as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                chunk = 64 * 1024
+                data = b''
+                pos = size
+                while pos > 0 and data.count(b'\n') <= n:
+                    read_size = min(chunk, pos)
+                    pos -= read_size
+                    f.seek(pos)
+                    data = f.read(read_size) + data
+                lines = data.decode('utf-8', errors='replace').splitlines()
+                return lines[-n:]
+        except FileNotFoundError:
+            return []
+        except Exception:
+            logger.warning(f'failed to read log tail for {file_path}', exc_info=True)
+            return []
 
     def _get_overall_status(self, processes):
         states = [
