@@ -203,6 +203,10 @@ class MySQLApi:
 
         # Execute the query
         self.cursor.execute(query)
+        # Column names of the actual result. The initial replication uses them to
+        # map rows onto the structure snapshot taken when the copy started, so a
+        # DDL issued while the copy is running does not shift the values.
+        column_names = [column[0] for column in self.cursor.description]
         res = self.cursor.fetchall()
         
         if self.mysql_timezone and self.mysql_timezone != 'UTC':
@@ -215,7 +219,7 @@ class MySQLApi:
                         value = value.replace(tzinfo=tz)
                     new_row.append(value)
                 records.append(tuple(new_row))
-            return records
+            return column_names, records
         
         records = [x for x in res]
-        return records
+        return column_names, records

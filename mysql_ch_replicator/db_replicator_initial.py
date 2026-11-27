@@ -8,6 +8,8 @@ import pickle
 from logging import getLogger
 from enum import Enum
 
+import mysql.connector
+
 from .config import Settings
 from .mysql_api import MySQLApi
 from .clickhouse_api import ClickhouseApi
@@ -17,6 +19,44 @@ from .utils import touch_all_files
 from .common import Status
 
 logger = getLogger(__name__)
+
+
+def align_records_to_structure(column_names, records, table_structure: TableStructure):
+    """Map MySQL rows onto the field order of the structure snapshot.
+
+    The initial copy reads rows with ``SELECT *``, while the table structure is
+    a snapshot taken when the copy started. A DDL issued while the copy is
+    running (ADD/DROP COLUMN, reordering, ...) changes the shape of the returned
+    rows, so aligning by column name keeps the conversion and the ClickHouse
+    insert consistent:
+
+    - columns added after the snapshot are ignored; their values arrive later
+      through the binlog replay of the ``ADD COLUMN`` and the inserts that
+      follow it;
+    - columns dropped after the snapshot are filled with ``None`` (converted to
+      the ClickHouse default); the replayed ``DROP COLUMN`` removes them anyway.
+
+    Returns ``(aligned_records, missing_fields, extra_fields)``.
+    """
+    field_names = [field.name for field in table_structure.fields]
+    if column_names == field_names:
+        # Fast path: no structure drift, the rows already match the snapshot.
+        return records, [], []
+
+    index_by_name = {name: idx for idx, name in enumerate(column_names)}
+    field_name_set = set(field_names)
+    missing_fields = [name for name in field_names if name not in index_by_name]
+    extra_fields = [name for name in column_names if name not in field_name_set]
+
+    aligned_records = [
+        tuple(
+            row[index_by_name[name]] if name in index_by_name else None
+            for name in field_names
+        )
+        for row in records
+    ]
+    return aligned_records, missing_fields, extra_fields
+
 
 class DbReplicatorInitial:
     
@@ -206,6 +246,7 @@ class DbReplicatorInitial:
 
         stats_number_of_records = 0
         last_stats_dump_time = time.time()
+        last_alignment_warning = None
 
         while True:
 
@@ -219,15 +260,53 @@ class DbReplicatorInitial:
                         value = f"'{value}'"
                         query_start_values[i] = value
 
-            records = self.replicator.mysql_api.get_records(
-                table_name=table_name,
-                order_by=primary_keys,
-                limit=self.replicator.config.initial_replication_batch_size,
-                start_value=query_start_values,
-                worker_id=self.replicator.worker_id,
-                total_workers=self.replicator.total_workers,
-            )
+            try:
+                column_names, records = self.replicator.mysql_api.get_records(
+                    table_name=table_name,
+                    order_by=primary_keys,
+                    limit=self.replicator.config.initial_replication_batch_size,
+                    start_value=query_start_values,
+                    worker_id=self.replicator.worker_id,
+                    total_workers=self.replicator.total_workers,
+                )
+            except mysql.connector.errors.ProgrammingError as e:
+                # A table that was dropped or renamed while it was being copied
+                # (errno 1146) cannot be told apart from a rename here and would
+                # silently lose the rows that were not copied yet, so it stays
+                # fatal - exactly as before.
+                if e.errno == 1054:
+                    raise Exception(
+                        f'primary key of table {table_name} was changed during initial replication, '
+                        f'which is not supported - remove the state file and restart initial replication'
+                    ) from e
+                raise
+
             logger.debug(f'extracted {len(records)} records from mysql')
+
+            records, missing_fields, extra_fields = align_records_to_structure(
+                column_names, records, mysql_table_structure,
+            )
+            if missing_fields and extra_fields:
+                # A column disappeared while another one appeared: most likely a
+                # RENAME COLUMN / CHANGE COLUMN. Aligning by name cannot recover
+                # the values of a renamed column - the rows copied after the
+                # rename would silently get the column default instead - so fail
+                # instead of losing data. Pure ADD COLUMN (only extra), pure DROP
+                # COLUMN (only missing) and column reordering (neither) are still
+                # tolerated below.
+                raise Exception(
+                    f'table {table_name} lost columns {missing_fields} and gained columns {extra_fields} '
+                    f'during initial replication - this looks like a RENAME COLUMN / CHANGE COLUMN, '
+                    f'which is not supported during the initial copy. '
+                    f'Remove the state file and restart the initial replication after the change.'
+                )
+            if (missing_fields or extra_fields) and (missing_fields, extra_fields) != last_alignment_warning:
+                last_alignment_warning = (missing_fields, extra_fields)
+                logger.warning(
+                    f'table {table_name} structure changed during initial replication '
+                    f'(dropped columns: {missing_fields}, added columns: {extra_fields}) - '
+                    f'aligning rows by column name; added column values are filled by binlog replay'
+                )
 
             records = self.replicator.converter.convert_records(records, mysql_table_structure, clickhouse_table_structure)
 
@@ -278,25 +357,33 @@ class DbReplicatorInitial:
 
     def verify_table_structures_after_replication(self):
         """
-        Verify that MySQL table structures haven't changed during the initial replication process.
-        This helps ensure data integrity by confirming the source tables are the same as when 
-        replication started.
-        
-        Raises an exception if any table structure has changed, preventing the completion
-        of the initial replication process.
+        Check the MySQL table structures after the initial copy.
+
+        DDL is allowed while the initial copy is running: the binlog position was
+        recorded before the copy started, so every DDL issued during the copy is
+        in the replay window and is applied to ClickHouse right after the copy.
+        Column level changes (ADD/DROP/MODIFY/CHANGE) are therefore logged and
+        left to the replay instead of aborting the replication.
+
+        A primary key or charset change cannot be recovered this way (the copy was
+        paginated by the old primary key and the ClickHouse table was created with
+        it), so those are still reported as fatal.
         """
         logger.info('Verifying table structures after initial replication')
-        
+
         changed_tables = []
-        
+        fatal_tables = []
+
         for table_name in self.replicator.state.tables:
             if not self.replicator.config.is_table_matches(table_name):
                 continue
                 
             if self.replicator.single_table and self.replicator.single_table != table_name:
                 continue
-                
-            # Get the current MySQL table structure
+
+            # A table dropped or renamed during the copy is fatal: it cannot be
+            # told apart from a rename, and skipping it would lose the rows the
+            # copy did not reach yet.
             current_mysql_create_statement = self.replicator.mysql_api.get_table_create_statement(table_name)
             current_mysql_structure = self.replicator.converter.parse_mysql_table_structure(
                 current_mysql_create_statement, required_table_name=table_name,
@@ -308,32 +395,42 @@ class DbReplicatorInitial:
             if not original_mysql_structure:
                 logger.warning(f'Could not find original structure for table {table_name}')
                 continue
-            
+
+            if original_mysql_structure.charset != current_mysql_structure.charset:
+                fatal_tables.append(f'{table_name} (charset changed)')
+                continue
+
+            if original_mysql_structure.primary_keys != current_mysql_structure.primary_keys:
+                fatal_tables.append(f'{table_name} (primary key changed)')
+                continue
+
             # Compare the structures in a deterministic way
-            structures_match = self._compare_table_structures(original_mysql_structure, current_mysql_structure)
-                
-            if not structures_match:
-                logger.warning(
-                    f'\n\n\n    !!!  WARNING - TABLE STRUCTURE CHANGED DURING REPLICATION (table "{table_name}") !!!\n\n'
-                    'The MySQL table structure has changed since the initial replication started.\n'
-                    'This may cause data inconsistency and replication issues.\n'
-                )
-                logger.error(f'Original structure: {original_mysql_structure}')
-                logger.error(f'Current structure: {current_mysql_structure}')
-                changed_tables.append(table_name)
-            else:
+            if self._compare_table_structures(original_mysql_structure, current_mysql_structure):
                 logger.info(f'Table structure verification passed for {table_name}')
-        
-        # If any tables have changed, raise an exception to abort the replication process
-        if changed_tables:
+            else:
+                logger.warning(
+                    f'table {table_name} structure changed during initial replication - '
+                    f'the change will be applied by binlog replay'
+                )
+                changed_tables.append(table_name)
+
+        if fatal_tables:
             error_message = (
-                f"Table structure changes detected in: {', '.join(changed_tables)}. "
-                "Initial replication aborted to prevent data inconsistency. "
-                "Please restart replication after reviewing the changes."
+                f"Unsupported table structure changes detected in: {', '.join(fatal_tables)}. "
+                "Primary key and charset changes cannot be applied during initial replication. "
+                "Remove the state file and restart the initial replication to pick up the new structure."
             )
             logger.error(error_message)
             raise Exception(error_message)
-                
+
+        if changed_tables:
+            logger.warning(
+                f'table structure changes during initial replication: {", ".join(changed_tables)}. '
+                f'They are applied to ClickHouse by the binlog replay. If a column was dropped or '
+                f'renamed, rows copied after the change may miss its values - remove the state file '
+                f'and restart the initial replication if that matters.'
+            )
+
         logger.info('Table structure verification completed')
     
     def _compare_table_structures(self, struct1, struct2):
@@ -343,44 +440,44 @@ class DbReplicatorInitial:
         """
         # Compare basic attributes
         if struct1.table_name != struct2.table_name:
-            logger.error(f"Table name mismatch: {struct1.table_name} vs {struct2.table_name}")
+            logger.info(f"Table name mismatch: {struct1.table_name} vs {struct2.table_name}")
             return False
             
         if struct1.charset != struct2.charset:
-            logger.error(f"Charset mismatch: {struct1.charset} vs {struct2.charset}")
+            logger.info(f"Charset mismatch: {struct1.charset} vs {struct2.charset}")
             return False
             
         # Compare primary keys (order matters)
         if len(struct1.primary_keys) != len(struct2.primary_keys):
-            logger.error(f"Primary key count mismatch: {len(struct1.primary_keys)} vs {len(struct2.primary_keys)}")
+            logger.info(f"Primary key count mismatch: {len(struct1.primary_keys)} vs {len(struct2.primary_keys)}")
             return False
             
         for i, key in enumerate(struct1.primary_keys):
             if key != struct2.primary_keys[i]:
-                logger.error(f"Primary key mismatch at position {i}: {key} vs {struct2.primary_keys[i]}")
+                logger.info(f"Primary key mismatch at position {i}: {key} vs {struct2.primary_keys[i]}")
                 return False
                 
         # Compare fields (count and attributes)
         if len(struct1.fields) != len(struct2.fields):
-            logger.error(f"Field count mismatch: {len(struct1.fields)} vs {len(struct2.fields)}")
+            logger.info(f"Field count mismatch: {len(struct1.fields)} vs {len(struct2.fields)}")
             return False
             
         for i, field1 in enumerate(struct1.fields):
             field2 = struct2.fields[i]
             
             if field1.name != field2.name:
-                logger.error(f"Field name mismatch at position {i}: {field1.name} vs {field2.name}")
+                logger.info(f"Field name mismatch at position {i}: {field1.name} vs {field2.name}")
                 return False
                 
             if field1.field_type != field2.field_type:
-                logger.error(f"Field type mismatch for {field1.name}: {field1.field_type} vs {field2.field_type}")
+                logger.info(f"Field type mismatch for {field1.name}: {field1.field_type} vs {field2.field_type}")
                 return False
                 
             # Compare parameters - normalize whitespace to avoid false positives
             params1 = ' '.join(field1.parameters.lower().split())
             params2 = ' '.join(field2.parameters.lower().split())
             if params1 != params2:
-                logger.error(f"Field parameters mismatch for {field1.name}: {params1} vs {params2}")
+                logger.info(f"Field parameters mismatch for {field1.name}: {params1} vs {params2}")
                 return False
                 
         return True

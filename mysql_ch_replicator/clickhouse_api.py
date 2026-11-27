@@ -413,8 +413,17 @@ class ClickhouseApi:
             logger.debug(f'create table query: {query}')
             self.execute_ddl_command(query, TABLE_ALREADY_APPLIED_ERRORS)
 
-    def insert(self, table_name, records, table_structure: TableStructure = None):
+    def insert(self, table_name, records, table_structure: TableStructure = None, column_names: list | None = None):
         current_version = self.get_last_used_version(table_name) + 1
+
+        # Insert by explicit column names whenever the structure is known. A row
+        # can be out of sync with the table definition (e.g. a DDL was issued
+        # while the initial copy was running and the binlog replay has not been
+        # applied yet); matching by name lets ClickHouse fill the missing
+        # columns with their defaults instead of failing on a column count
+        # mismatch. `_version` is appended to every record below.
+        if column_names is None and table_structure is not None:
+            column_names = [field.name for field in table_structure.fields] + ['_version']
 
         records_to_insert = []
         for record in records:
@@ -459,7 +468,7 @@ class ClickhouseApi:
         for attempt in range(ClickhouseApi.MAX_RETRIES):
             try:
                 t1 = time.time()
-                self.client.insert(table=full_table_name, data=records_to_insert)
+                self.client.insert(table=full_table_name, data=records_to_insert, column_names=column_names)
                 t2 = time.time()
                 duration += (t2 - t1)
                 break

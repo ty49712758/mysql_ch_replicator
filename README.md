@@ -409,7 +409,7 @@ Please note:
  - Check that this record appears in ClickHouse
 
 #### Known Limitations
-1. Migrations not supported during initial replication. You should either wait for initial replication finish and then apply migrations, or restart initial replication from scratch (by removing state file).
+1. DDL during initial replication is tolerated for adding/dropping columns and for type changes: they are applied by the binlog replay that follows the copy. Still fatal: dropping or renaming a table, renaming a column (`RENAME COLUMN` / `CHANGE COLUMN` with a new name), and primary key or charset changes. A missing table or a renamed column cannot be recovered by name alignment, so the copy aborts instead of silently losing rows. Remove the state file and restart the initial replication after such changes.
 2. Primary key changes not supported. This is a ClickHouse level limitation, it does not allow to make any changes realted to primary key.
 3. Tables without a primary key are not supported.
 
